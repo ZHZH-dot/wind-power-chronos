@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import pandas as pd
+
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from src.evaluation.metrics import mae, nmae, nrmse, rmse
 
@@ -66,7 +70,10 @@ def evaluate_predictions(predictions: pd.DataFrame) -> pd.DataFrame:
             }
         )
 
-    return pd.DataFrame(rows).sort_values(["horizon", "mode"]).reset_index(drop=True)
+    columns = ["mode", "horizon", "n", "mae", "rmse", "nmae", "nrmse"]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns).sort_values(["horizon", "mode"]).reset_index(drop=True)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

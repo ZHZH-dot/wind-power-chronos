@@ -142,6 +142,11 @@ def prepare_sdwpf_dataframe(
 
 
 def write_table(df: pd.DataFrame, output_path: Path) -> None:
+    raw_dir = Path("data/raw").resolve()
+    resolved_output = output_path.resolve()
+    if resolved_output == raw_dir or raw_dir in resolved_output.parents:
+        raise ValueError("Refusing to write processed output under data/raw/.")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.suffix.lower() == ".csv":
         df.to_csv(output_path, index=False)

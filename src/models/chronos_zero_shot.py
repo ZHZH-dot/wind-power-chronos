@@ -15,16 +15,35 @@ DEFAULT_HORIZONS = [1, 6, 24, 72]
 DEFAULT_QUANTILES = [0.1, 0.5, 0.9]
 
 
-def parse_csv_list(value: str | None) -> list[str]:
-    if value is None or value.strip() == "":
+def parse_csv_list(value: str | list[str] | None) -> list[str]:
+    if value is None:
         return []
-    return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        parts = value
+    else:
+        if value.strip() == "":
+            return []
+        parts = value.split(",")
+    return [str(item).strip() for item in parts if str(item).strip()]
 
 
-def parse_int_list(value: str | None) -> list[int]:
-    if value is None or value.strip() == "":
+def parse_int_list(value: str | list[str] | list[int] | None) -> list[int]:
+    if value is None:
         return DEFAULT_HORIZONS.copy()
-    horizons = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if isinstance(value, str):
+        if value.strip() == "":
+            return DEFAULT_HORIZONS.copy()
+        parts: list[str | int] = value.split(",")
+    else:
+        parts = value
+
+    horizons: list[int] = []
+    for part in parts:
+        if isinstance(part, int):
+            horizons.append(part)
+            continue
+        horizons.extend(int(item.strip()) for item in part.split(",") if item.strip())
+
     if not horizons or any(horizon <= 0 for horizon in horizons):
         raise ValueError("Horizons must be positive integers.")
     return sorted(set(horizons))
@@ -43,6 +62,10 @@ def read_table(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".csv":
         return pd.read_csv(path)
     return pd.read_parquet(path)
+
+
+def default_prediction_path(mode: str) -> Path:
+    return Path("results") / "zero_shot" / f"predictions_{mode}.csv"
 
 
 def load_chronos2_pipeline(model_id: str = DEFAULT_MODEL_ID, device_map: str = DEFAULT_DEVICE_MAP) -> Any:
@@ -250,9 +273,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output",
-        default=Path("results/chronos_zero_shot_predictions.csv"),
+        default=None,
         type=Path,
-        help="Prediction output CSV/parquet path.",
+        help="Prediction output CSV/parquet path. Defaults to results/zero_shot/predictions_<mode>.csv.",
     )
     parser.add_argument("--model_id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device-map", default=DEFAULT_DEVICE_MAP)
@@ -262,12 +285,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Comma-separated covariates used only in multivariate mode.",
     )
-    parser.add_argument("--horizons", default="1,6,24,72")
+    parser.add_argument(
+        "--horizons",
+        nargs="+",
+        default=DEFAULT_HORIZONS,
+        help="Forecast horizons. Supports '--horizons 1 6 24 72' or '--horizons 1,6,24,72'.",
+    )
     parser.add_argument("--context-length", default=168, type=int)
     parser.add_argument("--stride", default=24, type=int)
     parser.add_argument("--quantiles", default="0.1,0.5,0.9")
     parser.add_argument("--prediction-column", default=None)
-    parser.add_argument("--limit-turbines", default=None, type=int)
+    parser.add_argument(
+        "--max_turbines",
+        "--limit-turbines",
+        dest="max_turbines",
+        default=None,
+        type=int,
+        help="Limit turbine count for smoke tests.",
+    )
     parser.add_argument("--max-windows-per-turbine", default=None, type=int)
     parser.add_argument(
         "--allow-future-covariates",
@@ -289,6 +324,7 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     data = read_table(args.input)
     pipeline = load_chronos2_pipeline(model_id=args.model_id, device_map=args.device_map)
+    output_path = args.output or default_prediction_path(args.mode)
     predictions = run_rolling_forecasts(
         pipeline=pipeline,
         df=data,
@@ -300,12 +336,12 @@ def main() -> None:
         quantile_levels=parse_float_list(args.quantiles),
         model_id=args.model_id,
         prediction_column=args.prediction_column,
-        limit_turbines=args.limit_turbines,
+        limit_turbines=args.max_turbines,
         max_windows_per_turbine=args.max_windows_per_turbine,
         allow_future_covariates=args.allow_future_covariates,
     )
-    write_predictions(predictions, args.output)
-    print(f"Wrote {len(predictions):,} predictions to {args.output}")
+    write_predictions(predictions, output_path)
+    print(f"Wrote {len(predictions):,} predictions to {output_path}")
 
 
 if __name__ == "__main__":

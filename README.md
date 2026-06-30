@@ -2,16 +2,11 @@
 
 Production-oriented SDWPF wind power forecasting MVP using Chronos-2 zero-shot inference.
 
-## Environment Setup
+This stage is inference only. There is no fine-tuning or training code in the first pipeline.
 
-Use Python 3.10+ on AutoDL or a similar CUDA machine.
+## Model Constraint
 
-```bash
-python -m pip install --upgrade pip
-python -m pip install "chronos-forecasting" "pandas[pyarrow]" numpy pytest
-```
-
-The inference script loads the model with:
+Use Chronos-2 only:
 
 ```python
 from chronos import Chronos2Pipeline
@@ -19,19 +14,19 @@ from chronos import Chronos2Pipeline
 Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map="cuda")
 ```
 
-Local tests are CPU-only and do not download the model.
+The default `--model_id` is `amazon/chronos-2`. The excluded model families are not part of this repository.
 
 ## Data Layout
 
-Place the raw SDWPF CSV at:
+Put the raw SDWPF CSV anywhere readable on the machine, commonly:
 
 ```text
-data/raw/sdwpf.csv
+data/raw/<your-sdwpf-file>.csv
 ```
 
-Raw files under `data/raw/` are treated as read-only. Prepared data is written to `data/processed/`, and predictions/metrics are written to `results/`.
+Raw files under `data/raw/` are read-only inputs. Prepared data is written to `data/processed/`; predictions and metrics are written to `results/`.
 
-The processed table uses:
+The processed table schema is:
 
 ```text
 id, timestamp, target, optional covariates...
@@ -43,11 +38,22 @@ Default SDWPF covariates:
 Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv
 ```
 
+## Local CPU Test
+
+Local tests do not load Chronos-2 and do not require a GPU.
+
+```bash
+python -m pip install -r requirements.txt
+python -m pytest tests
+```
+
 ## Prepare SDWPF
+
+For the standard SDWPF `Day` plus `Tmstamp` format:
 
 ```bash
 python -m src.data.prepare_sdwpf \
-  --input data/raw/sdwpf.csv \
+  --input data/raw/<your-sdwpf-file>.csv \
   --output data/processed/sdwpf_hourly.parquet \
   --id-column TurbID \
   --day-column Day \
@@ -57,87 +63,90 @@ python -m src.data.prepare_sdwpf \
   --freq 1h
 ```
 
-For a raw file that already has a datetime column, use `--timestamp-column` instead of `--day-column` and `--time-column`.
+If the raw file already has a datetime column, use `--timestamp-column` instead of `--day-column` and `--time-column`.
 
-## Smoke Test
+## AutoDL GPU Run
 
-Run one turbine and one rolling window first:
+Clone the repo on AutoDL, place or mount the raw SDWPF CSV, then run:
+
+```bash
+bash scripts/run_zero_shot_autodl.sh /root/autodl-tmp/<your-sdwpf-file>.csv
+```
+
+The script creates a conda environment named `wind-chronos`, installs `requirements-autodl.txt`, prepares SDWPF, runs CPU-only tests, runs one-turbine smoke tests, then runs full univariate and multivariate zero-shot evaluation.
+
+Override defaults when needed:
+
+```bash
+ENV_NAME=wind-chronos \
+COVARIATES=Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv \
+RESULT_DIR=results/zero_shot \
+bash scripts/run_zero_shot_autodl.sh /root/autodl-tmp/<your-sdwpf-file>.csv
+```
+
+A100 is not required for the one-turbine smoke test. It is useful for full SDWPF evaluation and later fine-tuning work, but fine-tuning is not implemented in this stage.
+
+## First Smoke Test
+
+Run one turbine and one rolling window before the full evaluation:
 
 ```bash
 python -m src.models.chronos_zero_shot \
   --input data/processed/sdwpf_hourly.parquet \
-  --output results/smoke_multivariate.csv \
+  --output results/zero_shot/smoke_multivariate.csv \
   --mode multivariate \
   --covariates Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv \
   --model_id amazon/chronos-2 \
   --device-map cuda \
-  --horizons 1,6,24,72 \
+  --horizons 1 6 24 72 \
   --context-length 168 \
   --stride 24 \
-  --limit-turbines 1 \
+  --max_turbines 1 \
   --max-windows-per-turbine 1
 ```
 
-## Univariate Example
+## Full SDWPF Zero-Shot Run
+
+Univariate baseline:
 
 ```bash
 python -m src.models.chronos_zero_shot \
   --input data/processed/sdwpf_hourly.parquet \
-  --output results/predictions_univariate.csv \
+  --output results/zero_shot/predictions_univariate.csv \
   --mode univariate \
   --model_id amazon/chronos-2 \
   --device-map cuda \
-  --horizons 1,6,24,72 \
+  --horizons 1 6 24 72 \
   --context-length 168 \
   --stride 24
 ```
 
-## Multivariate Example
-
-Measured future covariates are not used by default. The multivariate run passes past covariates only, which avoids leakage for SDWPF zero-shot evaluation.
+Multivariate covariate-informed run:
 
 ```bash
 python -m src.models.chronos_zero_shot \
   --input data/processed/sdwpf_hourly.parquet \
-  --output results/predictions_multivariate.csv \
+  --output results/zero_shot/predictions_multivariate.csv \
   --mode multivariate \
   --covariates Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv \
   --model_id amazon/chronos-2 \
   --device-map cuda \
-  --horizons 1,6,24,72 \
+  --horizons 1 6 24 72 \
   --context-length 168 \
   --stride 24
 ```
 
-Only use `--allow-future-covariates` when those future covariates are realistically available at prediction time.
+Measured future covariates are not used by default. Only pass `--allow-future-covariates` if those values would realistically be available at prediction time.
 
-## Evaluate
+Evaluate both modes:
 
 ```bash
 python -m src.evaluation.evaluate \
-  --predictions results/predictions_univariate.csv results/predictions_multivariate.csv \
+  --predictions \
+  results/zero_shot/predictions_univariate.csv \
+  results/zero_shot/predictions_multivariate.csv \
   --ground-truth data/processed/sdwpf_hourly.parquet \
-  --output results/zero_shot_metrics.csv
+  --output results/zero_shot/metrics.csv
 ```
 
-The result table reports MAE, RMSE, NMAE, and NRMSE by mode and horizon.
-
-## Full AutoDL Run
-
-```bash
-bash scripts/run_zero_shot_autodl.sh
-```
-
-Useful overrides:
-
-```bash
-RAW_CSV=/root/autodl-tmp/sdwpf.csv LIMIT_TURBINES=1 bash scripts/run_zero_shot_autodl.sh
-```
-
-Remove `LIMIT_TURBINES` for the full run.
-
-## Tests
-
-```bash
-python -m pytest tests
-```
+The metrics CSV reports MAE, RMSE, NMAE, and NRMSE by mode and horizon.
