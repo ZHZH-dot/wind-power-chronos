@@ -42,3 +42,30 @@ def test_prepare_sdwpf_preserves_covariate_means() -> None:
 
     assert processed.loc[0, "Wspd"] == pytest.approx(12.5)
     assert processed.loc[0, "Wdir"] == pytest.approx(102.5)
+
+
+def test_prepare_sdwpf_regularizes_missing_hour() -> None:
+    raw = pd.DataFrame(
+        {
+            "TurbID": [1, 1],
+            "timestamp": ["2020-01-01 00:00:00", "2020-01-01 02:00:00"],
+            "Patv": [1.0, 3.0],
+            "Wspd": [10.0, 30.0],
+        }
+    )
+
+    processed = prepare_sdwpf_dataframe(
+        raw,
+        timestamp_column="timestamp",
+        covariates=["Wspd"],
+        freq="1h",
+        regularize_hourly=True,
+    )
+
+    inserted = processed[processed["timestamp"] == pd.Timestamp("2020-01-01 01:00:00")]
+
+    assert len(processed) == 3
+    assert len(inserted) == 1
+    assert inserted.iloc[0]["target"] == pytest.approx(2.0)
+    assert inserted.iloc[0]["Wspd"] == pytest.approx(20.0)
+    assert bool(inserted.iloc[0]["is_imputed_target"]) is True

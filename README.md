@@ -65,6 +65,21 @@ python -m src.data.prepare_sdwpf \
 
 If the raw file already has a datetime column, use `--timestamp-column` instead of `--day-column` and `--time-column`.
 
+SDWPF can still have missing hourly rows after resampling. Chronos-2 requires regular hourly frequency, so for full zero-shot runs prepare the parquet with `--regularize-hourly`:
+
+```bash
+python -m src.data.prepare_sdwpf \
+  --input data/raw/<your-sdwpf-file>.csv \
+  --output data/processed/sdwpf_hourly_regularized.parquet \
+  --id-column TurbID \
+  --day-column Day \
+  --time-column Tmstamp \
+  --target-column Patv \
+  --covariates Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv \
+  --freq 1h \
+  --regularize-hourly
+```
+
 ## AutoDL GPU Run
 
 Clone the repo on AutoDL, place or mount the raw SDWPF CSV, then run:
@@ -105,7 +120,7 @@ Run one turbine and one rolling window before the full evaluation:
 
 ```bash
 python -m src.models.chronos_zero_shot \
-  --input data/processed/sdwpf_hourly.parquet \
+  --input data/processed/sdwpf_hourly_regularized.parquet \
   --output results/zero_shot/smoke_multivariate.csv \
   --mode multivariate \
   --covariates Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv \
@@ -124,7 +139,7 @@ Univariate baseline:
 
 ```bash
 python -m src.models.chronos_zero_shot \
-  --input data/processed/sdwpf_hourly.parquet \
+  --input data/processed/sdwpf_hourly_regularized.parquet \
   --output results/zero_shot/predictions_univariate.csv \
   --mode univariate \
   --model-id amazon/chronos-2 \
@@ -138,7 +153,7 @@ Multivariate covariate-informed run:
 
 ```bash
 python -m src.models.chronos_zero_shot \
-  --input data/processed/sdwpf_hourly.parquet \
+  --input data/processed/sdwpf_hourly_regularized.parquet \
   --output results/zero_shot/predictions_multivariate.csv \
   --mode multivariate \
   --covariates Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv \
@@ -165,7 +180,7 @@ Option B: pre-download the model on a machine that can access Hugging Face, then
 
 ```bash
 python src/models/chronos_zero_shot.py \
-  --input data/processed/sdwpf_hourly.parquet \
+  --input data/processed/sdwpf_hourly_regularized.parquet \
   --output results/zero_shot/chronos2_smoke_univariate.csv \
   --model-id /data/GDUT_stu/models/chronos-2 \
   --device-map cuda \
@@ -185,7 +200,7 @@ python -m src.evaluation.evaluate \
   --predictions \
   results/zero_shot/predictions_univariate.csv \
   results/zero_shot/predictions_multivariate.csv \
-  --ground-truth data/processed/sdwpf_hourly.parquet \
+  --ground-truth data/processed/sdwpf_hourly_regularized.parquet \
   --output results/zero_shot/metrics.csv
 ```
 

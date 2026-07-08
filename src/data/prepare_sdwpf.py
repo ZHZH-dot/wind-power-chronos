@@ -74,6 +74,7 @@ def resample_forecasting_table(
     table: pd.DataFrame,
     covariates: list[str],
     freq: str,
+    regularize_hourly: bool = False,
 ) -> pd.DataFrame:
     """Resample each turbine independently and average numeric values."""
     value_columns = ["target", *covariates]
@@ -92,9 +93,56 @@ def resample_forecasting_table(
         .reset_index()
     )
 
+    if regularize_hourly:
+        return regularize_hourly_table(resampled, covariates)
+
     resampled = resampled.dropna(subset=["target"])
     resampled = resampled.sort_values(["id", "timestamp"]).reset_index(drop=True)
     return resampled[["id", "timestamp", *value_columns]]
+
+
+def regularize_hourly_table(resampled: pd.DataFrame, covariates: list[str]) -> pd.DataFrame:
+    """Create a complete hourly grid per turbine and fill numeric gaps."""
+    value_columns = ["target", *covariates]
+    output_columns = ["id", "timestamp", *value_columns, "is_imputed_target"]
+    if resampled.empty:
+        empty = resampled.copy()
+        empty["is_imputed_target"] = pd.Series(dtype=bool)
+        return empty.reindex(columns=output_columns)
+
+    regularize_input = resampled[["id", "timestamp", *value_columns]].copy()
+    regularize_input["id"] = regularize_input["id"].astype(str)
+    regularize_input["timestamp"] = pd.to_datetime(regularize_input["timestamp"])
+
+    full_grid = pd.date_range(
+        regularize_input["timestamp"].min(),
+        regularize_input["timestamp"].max(),
+        freq="1h",
+    )
+
+    frames: list[pd.DataFrame] = []
+    for turbine_id, group in regularize_input.groupby("id", sort=True):
+        turbine_frame = (
+            group.drop_duplicates(subset=["timestamp"], keep="last")
+            .set_index("timestamp")
+            .sort_index()
+            .reindex(full_grid)
+        )
+        turbine_frame.index.name = "timestamp"
+        turbine_frame["id"] = str(turbine_id)
+
+        for column in value_columns:
+            turbine_frame[column] = pd.to_numeric(turbine_frame[column], errors="coerce")
+
+        turbine_frame["is_imputed_target"] = turbine_frame["target"].isna()
+        turbine_frame[value_columns] = (
+            turbine_frame[value_columns].interpolate(method="linear").ffill().bfill()
+        )
+        frames.append(turbine_frame.reset_index())
+
+    regularized = pd.concat(frames, ignore_index=True)
+    regularized = regularized.sort_values(["id", "timestamp"]).reset_index(drop=True)
+    return regularized[output_columns]
 
 
 def prepare_sdwpf_dataframe(
@@ -107,6 +155,7 @@ def prepare_sdwpf_dataframe(
     timestamp_origin: str = "2020-01-01",
     covariates: list[str] | None = None,
     freq: str = "1h",
+    regularize_hourly: bool = False,
 ) -> pd.DataFrame:
     """Convert raw SDWPF columns into id/timestamp/target plus selected covariates."""
     selected_covariates = list(dict.fromkeys(covariates or []))
@@ -138,7 +187,12 @@ def prepare_sdwpf_dataframe(
     for covariate in selected_covariates:
         prepared[covariate] = raw_df[covariate]
 
-    return resample_forecasting_table(prepared, selected_covariates, freq=freq)
+    return resample_forecasting_table(
+        prepared,
+        selected_covariates,
+        freq=freq,
+        regularize_hourly=regularize_hourly,
+    )
 
 
 def write_table(df: pd.DataFrame, output_path: Path) -> None:
@@ -183,6 +237,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Comma-separated covariate columns to preserve and average.",
     )
     parser.add_argument("--freq", default="1h", help="Pandas resampling frequency.")
+    parser.add_argument(
+        "--regularize-hourly",
+        action="store_true",
+        help="Fill every turbine onto a complete global hourly timestamp grid for Chronos-2.",
+    )
     return parser
 
 
@@ -199,6 +258,7 @@ def main() -> None:
         timestamp_origin=args.timestamp_origin,
         covariates=parse_csv_list(args.covariates),
         freq=args.freq,
+        regularize_hourly=args.regularize_hourly,
     )
     write_table(processed, args.output)
     print(f"Wrote {len(processed):,} rows to {args.output}")
