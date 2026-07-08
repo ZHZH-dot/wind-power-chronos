@@ -71,8 +71,6 @@ def default_prediction_path(mode: str) -> Path:
 def load_chronos2_pipeline(model_id: str = DEFAULT_MODEL_ID, device_map: str = DEFAULT_DEVICE_MAP) -> Any:
     from chronos import Chronos2Pipeline
 
-    if model_id == DEFAULT_MODEL_ID and device_map == DEFAULT_DEVICE_MAP:
-        return Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map="cuda")
     return Chronos2Pipeline.from_pretrained(model_id, device_map=device_map)
 
 
@@ -277,7 +275,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Prediction output CSV/parquet path. Defaults to results/zero_shot/predictions_<mode>.csv.",
     )
-    parser.add_argument("--model_id", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--model-id", "--model_id", dest="model_id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device-map", default=DEFAULT_DEVICE_MAP)
     parser.add_argument("--mode", choices=["univariate", "multivariate"], required=True)
     parser.add_argument(
@@ -296,6 +294,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quantiles", default="0.1,0.5,0.9")
     parser.add_argument("--prediction-column", default=None)
     parser.add_argument(
+        "--max-turbines",
         "--max_turbines",
         "--limit-turbines",
         dest="max_turbines",
@@ -323,7 +322,12 @@ def write_predictions(predictions: pd.DataFrame, output_path: Path) -> None:
 def main() -> None:
     args = build_arg_parser().parse_args()
     data = read_table(args.input)
-    pipeline = load_chronos2_pipeline(model_id=args.model_id, device_map=args.device_map)
+    from chronos import Chronos2Pipeline
+
+    pipeline = Chronos2Pipeline.from_pretrained(
+        args.model_id,
+        device_map=args.device_map,
+    )
     output_path = args.output or default_prediction_path(args.mode)
     predictions = run_rolling_forecasts(
         pipeline=pipeline,

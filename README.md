@@ -14,7 +14,7 @@ from chronos import Chronos2Pipeline
 Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map="cuda")
 ```
 
-The default `--model_id` is `amazon/chronos-2`. The excluded model families are not part of this repository.
+The default `--model-id` is `amazon/chronos-2`. The same argument can also be a local model directory such as `/data/GDUT_stu/models/chronos-2`. The legacy spelling `--model_id` is still accepted. The excluded model families are not part of this repository.
 
 ## Data Layout
 
@@ -75,6 +75,19 @@ bash scripts/run_zero_shot_autodl.sh /root/autodl-tmp/<your-sdwpf-file>.csv
 
 The script creates a conda environment named `wind-chronos`, installs `requirements-autodl.txt`, prepares SDWPF, runs CPU-only tests, runs one-turbine smoke tests, then runs full univariate and multivariate zero-shot evaluation.
 
+`requirements-autodl.txt` installs Chronos from the official GitHub repository. If installing manually, use:
+
+```bash
+pip install git+https://github.com/amazon-science/chronos-forecasting.git
+```
+
+Quick diagnostics:
+
+```bash
+python -c "from chronos import Chronos2Pipeline; print('Chronos2Pipeline import OK')"
+python -c "from chronos import Chronos2Pipeline; p=Chronos2Pipeline.from_pretrained('amazon/chronos-2', device_map='cuda'); print('Chronos-2 loaded OK')"
+```
+
 Override defaults when needed:
 
 ```bash
@@ -96,7 +109,7 @@ python -m src.models.chronos_zero_shot \
   --output results/zero_shot/smoke_multivariate.csv \
   --mode multivariate \
   --covariates Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv \
-  --model_id amazon/chronos-2 \
+  --model-id amazon/chronos-2 \
   --device-map cuda \
   --horizons 1 6 24 72 \
   --context-length 168 \
@@ -114,7 +127,7 @@ python -m src.models.chronos_zero_shot \
   --input data/processed/sdwpf_hourly.parquet \
   --output results/zero_shot/predictions_univariate.csv \
   --mode univariate \
-  --model_id amazon/chronos-2 \
+  --model-id amazon/chronos-2 \
   --device-map cuda \
   --horizons 1 6 24 72 \
   --context-length 168 \
@@ -129,7 +142,7 @@ python -m src.models.chronos_zero_shot \
   --output results/zero_shot/predictions_multivariate.csv \
   --mode multivariate \
   --covariates Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv \
-  --model_id amazon/chronos-2 \
+  --model-id amazon/chronos-2 \
   --device-map cuda \
   --horizons 1 6 24 72 \
   --context-length 168 \
@@ -137,6 +150,33 @@ python -m src.models.chronos_zero_shot \
 ```
 
 Measured future covariates are not used by default. Only pass `--allow-future-covariates` if those values would realistically be available at prediction time.
+
+## If Hugging Face Is Unavailable
+
+Do not use `https://huggingface.co/amazon/chronos-2/resolve/main` directly. That URL is not a valid model source in this pipeline. The code should load models only through `Chronos2Pipeline.from_pretrained(...)`.
+
+Option A: install Chronos code from GitHub.
+
+```bash
+pip install git+https://github.com/amazon-science/chronos-forecasting.git
+```
+
+Option B: pre-download the model on a machine that can access Hugging Face, then copy the local model folder to the server. Pass that folder as `--model-id`:
+
+```bash
+python src/models/chronos_zero_shot.py \
+  --input data/processed/sdwpf_hourly.parquet \
+  --output results/zero_shot/chronos2_smoke_univariate.csv \
+  --model-id /data/GDUT_stu/models/chronos-2 \
+  --device-map cuda \
+  --mode univariate \
+  --horizons 24 \
+  --context-length 168 \
+  --max-turbines 1 \
+  --max-windows-per-turbine 3
+```
+
+Option C: set Hugging Face mirror or cache environment variables if they are available in the server environment, then keep using `--model-id amazon/chronos-2`.
 
 Evaluate both modes:
 

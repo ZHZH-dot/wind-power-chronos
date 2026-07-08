@@ -1,4 +1,4 @@
-chronos-forecasting
+git+https://github.com/amazon-science/chronos-forecasting.git
 torch
 pandas
 pyarrow
