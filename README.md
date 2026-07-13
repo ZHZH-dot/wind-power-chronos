@@ -303,6 +303,36 @@ bash scripts/run_finetune_autodl.sh \
 
 Each run writes `run_config.json`, `resolved_split_manifest.json`, and the AutoGluon predictor under its output directory. The script refuses to overwrite an existing output directory.
 
+### Fine-Tuned Test Evaluation
+
+Evaluate the saved five-turbine LoRA smoke predictor with one leak-free test window per turbine before evaluating all test windows. This reloads `Chronos2LoRA`, verifies the adapter checkpoint and saved run configuration, reuses the run's resolved split manifest, and writes zero-shot-compatible predictions plus the existing metric table. Measured SDWPF variables are passed only as historical covariates, and imputed targets are excluded from scoring by default.
+
+```bash
+HF_HOME=/data/GDUT_stu/.cache/huggingface \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+CUDA_VISIBLE_DEVICES=0 \
+python -m src.evaluation.chronos_finetune_predict \
+  --predictor-path results/fine_tune/chronos2_lora_multivariate_5t_100s_retry2/predictor \
+  --input src/data/processed/sdwpf_hourly_regularized.parquet \
+  --split-config configs/splits/sdwpf_70_10_20.json \
+  --split-manifest results/fine_tune/chronos2_lora_multivariate_5t_100s_retry2/resolved_split_manifest.json \
+  --output results/fine_tune/chronos2_lora_multivariate_5t_100s_retry2/test_predictions_one_window.csv \
+  --metrics-output results/fine_tune/chronos2_lora_multivariate_5t_100s_retry2/test_metrics_one_window.csv \
+  --metadata-output results/fine_tune/chronos2_lora_multivariate_5t_100s_retry2/test_metadata_one_window.json \
+  --mode multivariate \
+  --covariates Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv \
+  --prediction-length 72 \
+  --context-length 168 \
+  --horizons 1 6 24 72 \
+  --inference-batch-size 64 \
+  --stride 24 \
+  --max-turbines 5 \
+  --max-windows-per-turbine 1
+```
+
+The metadata JSON records the deterministic five turbine IDs, predictor model name, adapter checkpoint, split boundaries, covariate policy, and output paths. Remove only `--max-windows-per-turbine 1` after the one-window evaluation succeeds and its outputs have been inspected.
+
 ## If Hugging Face Is Unavailable
 
 Do not use `https://huggingface.co/amazon/chronos-2/resolve/main` directly. That URL is not a valid model source in this pipeline. The code should load models only through `Chronos2Pipeline.from_pretrained(...)`.
