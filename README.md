@@ -26,10 +26,10 @@ data/raw/<your-sdwpf-file>.csv
 
 Raw files under `data/raw/` are read-only inputs. Prepared data is written to `data/processed/`; predictions and metrics are written to `results/`.
 
-The processed table schema is:
+The regularized processed table schema is:
 
 ```text
-id, timestamp, target, optional covariates...
+id, timestamp, target, optional covariates..., is_imputed_target
 ```
 
 Default SDWPF covariates:
@@ -65,7 +65,7 @@ python -m src.data.prepare_sdwpf \
 
 If the raw file already has a datetime column, use `--timestamp-column` instead of `--day-column` and `--time-column`.
 
-SDWPF can still have missing hourly rows after resampling. Chronos-2 requires regular hourly frequency, so for full zero-shot runs prepare the parquet with `--regularize-hourly`:
+SDWPF can still have missing hourly rows after resampling. Chronos-2 requires regular hourly frequency, so zero-shot benchmark runs must prepare the parquet with `--regularize-hourly`. Each turbine is regularized only between its own first and last timestamp. Inserted or originally missing targets are interpolated for model context and marked by `is_imputed_target`; they are not scored by default.
 
 ```bash
 python -m src.data.prepare_sdwpf \
@@ -80,6 +80,21 @@ python -m src.data.prepare_sdwpf \
   --regularize-hourly
 ```
 
+Create the exact split manifest once for this processed dataset:
+
+```bash
+python -m src.evaluation.splits \
+  --input data/processed/sdwpf_hourly_regularized.parquet \
+  --config configs/sdwpf_benchmark.json \
+  --output data/processed/sdwpf_split_manifest.json
+```
+
+## Benchmark Protocol
+
+`configs/sdwpf_benchmark.json` defines the reusable SDWPF benchmark. Sorted unique timestamps across the complete wind farm are divided chronologically: the first 70% are train, the next 10% are validation, and the final 20% are test. `data/processed/sdwpf_split_manifest.json` stores the resulting exact global boundaries so Chronos zero-shot, future statistical baselines, and future fine-tuning can use the same periods.
+
+Chronos zero-shot may use historical context before the test boundary, but it emits predictions only for test targets. A window is used only when its complete maximum forecast horizon remains in the test period. The benchmark horizons remain 1, 6, 24, and 72 hours.
+
 ## AutoDL GPU Run
 
 Clone the repo on AutoDL, place or mount the raw SDWPF CSV, then run:
@@ -88,7 +103,7 @@ Clone the repo on AutoDL, place or mount the raw SDWPF CSV, then run:
 bash scripts/run_zero_shot_autodl.sh /root/autodl-tmp/<your-sdwpf-file>.csv
 ```
 
-The script creates a conda environment named `wind-chronos`, installs `requirements-autodl.txt`, prepares SDWPF, runs CPU-only tests, runs one-turbine smoke tests, then runs full univariate and multivariate zero-shot evaluation.
+The script creates a conda environment named `wind-chronos`, installs `requirements-autodl.txt`, prepares and regularizes SDWPF, persists the benchmark split, runs CPU-only tests, runs one-turbine smoke tests, then runs full univariate and multivariate zero-shot evaluation.
 
 `requirements-autodl.txt` installs Chronos from the official GitHub repository. If installing manually, use:
 
@@ -129,6 +144,8 @@ python -m src.models.chronos_zero_shot \
   --horizons 1 6 24 72 \
   --context-length 168 \
   --stride 24 \
+  --benchmark-config configs/sdwpf_benchmark.json \
+  --split-manifest data/processed/sdwpf_split_manifest.json \
   --max_turbines 1 \
   --max-windows-per-turbine 1
 ```
@@ -146,7 +163,9 @@ python -m src.models.chronos_zero_shot \
   --device-map cuda \
   --horizons 1 6 24 72 \
   --context-length 168 \
-  --stride 24
+  --stride 24 \
+  --benchmark-config configs/sdwpf_benchmark.json \
+  --split-manifest data/processed/sdwpf_split_manifest.json
 ```
 
 Multivariate covariate-informed run:
@@ -161,10 +180,28 @@ python -m src.models.chronos_zero_shot \
   --device-map cuda \
   --horizons 1 6 24 72 \
   --context-length 168 \
-  --stride 24
+  --stride 24 \
+  --benchmark-config configs/sdwpf_benchmark.json \
+  --split-manifest data/processed/sdwpf_split_manifest.json
 ```
 
 Measured future covariates are not used by default. Only pass `--allow-future-covariates` if those values would realistically be available at prediction time.
+
+Evaluate both modes:
+
+```bash
+python -m src.evaluation.evaluate \
+  --predictions \
+  results/zero_shot/predictions_univariate.csv \
+  results/zero_shot/predictions_multivariate.csv \
+  --ground-truth data/processed/sdwpf_hourly_regularized.parquet \
+  --rated-capacity-kw 1500 \
+  --output results/zero_shot/metrics.csv
+```
+
+Evaluation excludes `is_imputed_target == True` rows unless `--include-imputed-targets` is explicitly supplied for diagnostics. It reports `n_scored`, `n_excluded_imputed`, MAE, RMSE, mean bias, `nmae_capacity`, and `nrmse_capacity`. A `rated_capacity_kw` column is used when present; otherwise SDWPF defaults to 1500 kW through `--rated-capacity-kw`.
+
+Prediction files preserve Chronos-2 `p10`, `p50`, and `p90`; `y_pred` remains an alias for `p50`. Point metrics use `p50`. Probabilistic metrics include pinball loss at each quantile, mean pinball loss, P10-P90 interval coverage, and mean interval width.
 
 ## If Hugging Face Is Unavailable
 
@@ -192,16 +229,3 @@ python src/models/chronos_zero_shot.py \
 ```
 
 Option C: set Hugging Face mirror or cache environment variables if they are available in the server environment, then keep using `--model-id amazon/chronos-2`.
-
-Evaluate both modes:
-
-```bash
-python -m src.evaluation.evaluate \
-  --predictions \
-  results/zero_shot/predictions_univariate.csv \
-  results/zero_shot/predictions_multivariate.csv \
-  --ground-truth data/processed/sdwpf_hourly_regularized.parquet \
-  --output results/zero_shot/metrics.csv
-```
-
-The metrics CSV reports MAE, RMSE, NMAE, and NRMSE by mode and horizon.

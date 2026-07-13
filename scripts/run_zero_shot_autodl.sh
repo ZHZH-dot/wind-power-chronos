@@ -3,17 +3,20 @@ set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: bash scripts/run_zero_shot_autodl.sh /path/to/raw_sdwpf.csv"
-  echo "Optional env vars: ENV_NAME, COVARIATES, RESULT_DIR, CONTEXT_LENGTH, STRIDE"
+  echo "Optional env vars: ENV_NAME, COVARIATES, RESULT_DIR, CONTEXT_LENGTH, STRIDE, RATED_CAPACITY_KW"
   exit 1
 fi
 
 RAW_CSV="$1"
 ENV_NAME="${ENV_NAME:-wind-chronos}"
-PROCESSED="${PROCESSED:-data/processed/sdwpf_hourly.parquet}"
+PROCESSED="${PROCESSED:-data/processed/sdwpf_hourly_regularized.parquet}"
+BENCHMARK_CONFIG="${BENCHMARK_CONFIG:-configs/sdwpf_benchmark.json}"
+SPLIT_MANIFEST="${SPLIT_MANIFEST:-data/processed/sdwpf_split_manifest.json}"
 COVARIATES="${COVARIATES:-Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv}"
 RESULT_DIR="${RESULT_DIR:-results/zero_shot}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-168}"
 STRIDE="${STRIDE:-24}"
+RATED_CAPACITY_KW="${RATED_CAPACITY_KW:-1500}"
 HORIZONS=(1 6 24 72)
 
 mkdir -p data/processed "${RESULT_DIR}"
@@ -37,7 +40,13 @@ python -m src.data.prepare_sdwpf \
   --time-column Tmstamp \
   --target-column Patv \
   --covariates "${COVARIATES}" \
-  --freq 1h
+  --freq 1h \
+  --regularize-hourly
+
+python -m src.evaluation.splits \
+  --input "${PROCESSED}" \
+  --config "${BENCHMARK_CONFIG}" \
+  --output "${SPLIT_MANIFEST}"
 
 python -m pytest tests
 
@@ -50,6 +59,8 @@ python -m src.models.chronos_zero_shot \
   --horizons "${HORIZONS[@]}" \
   --context-length "${CONTEXT_LENGTH}" \
   --stride "${STRIDE}" \
+  --benchmark-config "${BENCHMARK_CONFIG}" \
+  --split-manifest "${SPLIT_MANIFEST}" \
   --max_turbines 1 \
   --max-windows-per-turbine 1
 
@@ -63,6 +74,8 @@ python -m src.models.chronos_zero_shot \
   --horizons "${HORIZONS[@]}" \
   --context-length "${CONTEXT_LENGTH}" \
   --stride "${STRIDE}" \
+  --benchmark-config "${BENCHMARK_CONFIG}" \
+  --split-manifest "${SPLIT_MANIFEST}" \
   --max_turbines 1 \
   --max-windows-per-turbine 1
 
@@ -71,6 +84,7 @@ python -m src.evaluation.evaluate \
   "${RESULT_DIR}/smoke_univariate.csv" \
   "${RESULT_DIR}/smoke_multivariate.csv" \
   --ground-truth "${PROCESSED}" \
+  --rated-capacity-kw "${RATED_CAPACITY_KW}" \
   --output "${RESULT_DIR}/smoke_metrics.csv"
 
 python -m src.models.chronos_zero_shot \
@@ -81,7 +95,9 @@ python -m src.models.chronos_zero_shot \
   --device-map cuda \
   --horizons "${HORIZONS[@]}" \
   --context-length "${CONTEXT_LENGTH}" \
-  --stride "${STRIDE}"
+  --stride "${STRIDE}" \
+  --benchmark-config "${BENCHMARK_CONFIG}" \
+  --split-manifest "${SPLIT_MANIFEST}"
 
 python -m src.models.chronos_zero_shot \
   --input "${PROCESSED}" \
@@ -92,11 +108,14 @@ python -m src.models.chronos_zero_shot \
   --device-map cuda \
   --horizons "${HORIZONS[@]}" \
   --context-length "${CONTEXT_LENGTH}" \
-  --stride "${STRIDE}"
+  --stride "${STRIDE}" \
+  --benchmark-config "${BENCHMARK_CONFIG}" \
+  --split-manifest "${SPLIT_MANIFEST}"
 
 python -m src.evaluation.evaluate \
   --predictions \
   "${RESULT_DIR}/predictions_univariate.csv" \
   "${RESULT_DIR}/predictions_multivariate.csv" \
   --ground-truth "${PROCESSED}" \
+  --rated-capacity-kw "${RATED_CAPACITY_KW}" \
   --output "${RESULT_DIR}/metrics.csv"

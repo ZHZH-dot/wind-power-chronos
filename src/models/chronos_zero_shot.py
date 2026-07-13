@@ -3,10 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import re
+import sys
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from src.evaluation.splits import (
+    DEFAULT_BENCHMARK_CONFIG,
+    DEFAULT_SPLIT_MANIFEST,
+    ensure_split_manifest,
+    test_period,
+)
 
 
 DEFAULT_MODEL_ID = "amazon/chronos-2"
@@ -120,6 +132,82 @@ def choose_prediction_column(
     )
 
 
+def _quantile_from_column_name(column: Any, target_column: str = "target") -> float | None:
+    if not isinstance(column, str):
+        try:
+            value = float(column)
+        except (TypeError, ValueError):
+            return None
+        return value if 0 < value < 1 else None
+
+    label = column.strip().lower()
+    target = target_column.strip().lower()
+    for prefix in (f"{target}_", f"{target}-"):
+        if label.startswith(prefix):
+            label = label[len(prefix) :]
+            break
+
+    probability_match = re.fullmatch(r"p[_-]?(\d+(?:\.\d+)?)", label)
+    if probability_match:
+        value = float(probability_match.group(1)) / 100.0
+        return value if 0 < value < 1 else None
+
+    quantile_match = re.fullmatch(
+        r"(?:q|quantile)[_-]?(\d+(?:\.\d+)?)",
+        label,
+    )
+    if quantile_match:
+        value = float(quantile_match.group(1))
+        if value > 1:
+            value /= 100.0
+        return value if 0 < value < 1 else None
+
+    try:
+        value = float(label)
+    except ValueError:
+        return None
+    return value if 0 < value < 1 else None
+
+
+def choose_quantile_column(
+    forecast_df: pd.DataFrame,
+    quantile: float,
+    prediction_column: str | None = None,
+    target_column: str = "target",
+) -> Any:
+    percentile = int(round(quantile * 100))
+    candidates: list[Any] = [
+        prediction_column if quantile == 0.5 else None,
+        quantile,
+        str(quantile),
+        f"{quantile:g}",
+        f"p{percentile}",
+        f"P{percentile}",
+        f"q{quantile:g}",
+        f"quantile_{quantile:g}",
+        f"{target_column}_{quantile:g}",
+        f"{target_column}_p{percentile}",
+        f"{target_column}_q{quantile:g}",
+        f"{target_column}_quantile_{quantile:g}",
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate in forecast_df.columns:
+            return candidate
+
+    for column in forecast_df.columns:
+        parsed = _quantile_from_column_name(column, target_column=target_column)
+        if parsed is not None and abs(parsed - quantile) < 1e-9:
+            return column
+
+    if quantile == 0.5:
+        return choose_prediction_column(
+            forecast_df,
+            prediction_column=prediction_column,
+            target_column=target_column,
+        )
+    raise ValueError(f"Could not identify the {quantile:g} quantile column in Chronos output.")
+
+
 def normalize_forecast_df(forecast_df: pd.DataFrame) -> pd.DataFrame:
     normalized = forecast_df.reset_index()
     if "timestamp" not in normalized.columns and "index" in normalized.columns:
@@ -129,13 +217,12 @@ def normalize_forecast_df(forecast_df: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
-def extract_prediction(
+def select_forecast_row(
     forecast_df: pd.DataFrame,
     turbine_id: str,
     forecast_timestamp: pd.Timestamp,
     horizon: int,
-    prediction_column: str | None,
-) -> float:
+) -> tuple[pd.DataFrame, pd.Series]:
     forecast = normalize_forecast_df(forecast_df)
     if "id" in forecast.columns:
         forecast = forecast[forecast["id"].astype(str) == str(turbine_id)]
@@ -143,18 +230,66 @@ def extract_prediction(
     if "timestamp" in forecast.columns:
         matching_rows = forecast[forecast["timestamp"] == forecast_timestamp]
         if not matching_rows.empty:
-            row = matching_rows.iloc[0]
-            column = choose_prediction_column(forecast, prediction_column)
-            return float(row[column])
-        else:
-            forecast = forecast.sort_values("timestamp")
+            return forecast, matching_rows.iloc[0]
+        forecast = forecast.sort_values("timestamp")
 
     if forecast.empty or len(forecast) < horizon:
         raise ValueError(f"Forecast output does not contain horizon {horizon}.")
+    return forecast, forecast.iloc[horizon - 1]
 
-    row = forecast.iloc[horizon - 1]
+
+def extract_prediction(
+    forecast_df: pd.DataFrame,
+    turbine_id: str,
+    forecast_timestamp: pd.Timestamp,
+    horizon: int,
+    prediction_column: str | None,
+) -> float:
+    forecast, row = select_forecast_row(
+        forecast_df,
+        turbine_id=turbine_id,
+        forecast_timestamp=forecast_timestamp,
+        horizon=horizon,
+    )
     column = choose_prediction_column(forecast, prediction_column)
     return float(row[column])
+
+
+def extract_quantile_predictions(
+    forecast_df: pd.DataFrame,
+    turbine_id: str,
+    forecast_timestamp: pd.Timestamp,
+    horizon: int,
+    prediction_column: str | None = None,
+) -> dict[str, float]:
+    """Extract the required Chronos quantiles across supported column naming styles."""
+    forecast, row = select_forecast_row(
+        forecast_df,
+        turbine_id=turbine_id,
+        forecast_timestamp=forecast_timestamp,
+        horizon=horizon,
+    )
+    values: dict[str, float] = {}
+    for name, quantile in (("p10", 0.1), ("p50", 0.5), ("p90", 0.9)):
+        column = choose_quantile_column(
+            forecast,
+            quantile=quantile,
+            prediction_column=prediction_column,
+        )
+        values[name] = float(row[column])
+    return values
+
+
+def _as_bool(value: object) -> bool:
+    if pd.isna(value):
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no", ""}:
+            return False
+    return bool(value)
 
 
 def build_context(
@@ -182,6 +317,8 @@ def run_rolling_forecasts(
     limit_turbines: int | None = None,
     max_windows_per_turbine: int | None = None,
     allow_future_covariates: bool = False,
+    test_start: pd.Timestamp | str | None = None,
+    test_end: pd.Timestamp | str | None = None,
 ) -> pd.DataFrame:
     if context_length <= 0:
         raise ValueError("--context-length must be positive.")
@@ -195,6 +332,15 @@ def run_rolling_forecasts(
     data["timestamp"] = pd.to_datetime(data["timestamp"])
     data = data.sort_values(["id", "timestamp"]).reset_index(drop=True)
 
+    if (test_start is None) != (test_end is None):
+        raise ValueError("test_start and test_end must be provided together.")
+    if test_start is None:
+        manifest = ensure_split_manifest(data)
+        test_start, test_end = test_period(manifest)
+    test_start = pd.Timestamp(test_start)
+    test_end = pd.Timestamp(test_end)
+    required_quantiles = sorted(set([*quantile_levels, *DEFAULT_QUANTILES]))
+
     if limit_turbines is not None:
         turbine_ids = data["id"].drop_duplicates().head(limit_turbines)
         data = data[data["id"].isin(turbine_ids)]
@@ -205,8 +351,15 @@ def run_rolling_forecasts(
         if len(group) < context_length + max_horizon:
             continue
 
+        eligible_cutoffs: list[int] = []
+        for cutoff_pos in range(context_length - 1, len(group) - max_horizon):
+            first_forecast_timestamp = pd.Timestamp(group.iloc[cutoff_pos + 1]["timestamp"])
+            last_forecast_timestamp = pd.Timestamp(group.iloc[cutoff_pos + max_horizon]["timestamp"])
+            if first_forecast_timestamp >= test_start and last_forecast_timestamp <= test_end:
+                eligible_cutoffs.append(cutoff_pos)
+
         windows_done = 0
-        for cutoff_pos in range(context_length - 1, len(group) - max_horizon, stride):
+        for cutoff_pos in eligible_cutoffs[::stride]:
             context_df = build_context(group, cutoff_pos, context_length, context_columns)
             if len(context_df) < context_length:
                 continue
@@ -220,7 +373,7 @@ def run_rolling_forecasts(
                 context_df,
                 future_df=future_df,
                 prediction_length=max_horizon,
-                quantile_levels=quantile_levels,
+                quantile_levels=required_quantiles,
                 id_column="id",
                 timestamp_column="timestamp",
                 target="target",
@@ -230,25 +383,33 @@ def run_rolling_forecasts(
             for horizon in horizons:
                 actual_row = group.iloc[cutoff_pos + horizon]
                 forecast_timestamp = pd.Timestamp(actual_row["timestamp"])
-                records.append(
-                    {
-                        "id": str(turbine_id),
-                        "mode": mode,
-                        "horizon": int(horizon),
-                        "cutoff_timestamp": cutoff_timestamp,
-                        "timestamp": forecast_timestamp,
-                        "y_true": float(actual_row["target"]),
-                        "y_pred": extract_prediction(
-                            forecast_df,
-                            turbine_id=str(turbine_id),
-                            forecast_timestamp=forecast_timestamp,
-                            horizon=horizon,
-                            prediction_column=prediction_column,
-                        ),
-                        "model_id": model_id,
-                        "used_future_covariates": bool(allow_future_covariates),
-                    }
+                quantiles = extract_quantile_predictions(
+                    forecast_df,
+                    turbine_id=str(turbine_id),
+                    forecast_timestamp=forecast_timestamp,
+                    horizon=horizon,
+                    prediction_column=prediction_column,
                 )
+                record: dict[str, object] = {
+                    "id": str(turbine_id),
+                    "mode": mode,
+                    "horizon": int(horizon),
+                    "cutoff_timestamp": cutoff_timestamp,
+                    "timestamp": forecast_timestamp,
+                    "y_true": float(actual_row["target"]),
+                    "is_imputed_target": _as_bool(actual_row.get("is_imputed_target", False)),
+                    "p10": quantiles["p10"],
+                    "p50": quantiles["p50"],
+                    "p90": quantiles["p90"],
+                    "y_pred": quantiles["p50"],
+                    "test_start": test_start,
+                    "test_end": test_end,
+                    "model_id": model_id,
+                    "used_future_covariates": bool(allow_future_covariates),
+                }
+                if "rated_capacity_kw" in group.columns:
+                    record["rated_capacity_kw"] = actual_row["rated_capacity_kw"]
+                records.append(record)
 
             windows_done += 1
             if max_windows_per_turbine is not None and windows_done >= max_windows_per_turbine:
@@ -265,7 +426,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input",
-        default=Path("data/processed/sdwpf_hourly.parquet"),
+        default=Path("data/processed/sdwpf_hourly_regularized.parquet"),
         type=Path,
         help="Processed SDWPF parquet/CSV path.",
     )
@@ -293,6 +454,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stride", default=24, type=int)
     parser.add_argument("--quantiles", default="0.1,0.5,0.9")
     parser.add_argument("--prediction-column", default=None)
+    parser.add_argument(
+        "--benchmark-config",
+        default=DEFAULT_BENCHMARK_CONFIG,
+        type=Path,
+        help="Reusable benchmark configuration defining the chronological split.",
+    )
+    parser.add_argument(
+        "--split-manifest",
+        default=DEFAULT_SPLIT_MANIFEST,
+        type=Path,
+        help="Persisted exact split boundaries shared across benchmark runs.",
+    )
     parser.add_argument(
         "--max-turbines",
         "--max_turbines",
@@ -322,6 +495,12 @@ def write_predictions(predictions: pd.DataFrame, output_path: Path) -> None:
 def main() -> None:
     args = build_arg_parser().parse_args()
     data = read_table(args.input)
+    split_manifest = ensure_split_manifest(
+        data,
+        config_path=args.benchmark_config,
+        manifest_path=args.split_manifest,
+    )
+    test_start, test_end = test_period(split_manifest)
     from chronos import Chronos2Pipeline
 
     pipeline = Chronos2Pipeline.from_pretrained(
@@ -343,6 +522,8 @@ def main() -> None:
         limit_turbines=args.max_turbines,
         max_windows_per_turbine=args.max_windows_per_turbine,
         allow_future_covariates=args.allow_future_covariates,
+        test_start=test_start,
+        test_end=test_end,
     )
     write_predictions(predictions, output_path)
     print(f"Wrote {len(predictions):,} predictions to {output_path}")

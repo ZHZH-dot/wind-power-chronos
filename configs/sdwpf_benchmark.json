@@ -1,0 +1,10 @@
+{
+  "name": "sdwpf_chronological_v1",
+  "frequency": "1h",
+  "split_strategy": "global_chronological_timestamp",
+  "train_fraction": 0.7,
+  "validation_fraction": 0.1,
+  "test_fraction": 0.2,
+  "horizons_hours": [1, 6, 24, 72],
+  "rated_capacity_kw": 1500.0
+}

@@ -9,3 +9,9 @@ data/processed/
 data/external/
 results/
 experiments/
+# SDWPF dataset files
+src/data/raw/SDWPF/
+src/data/processed/*.parquet
+
+# Windows download metadata
+*Zone.Identifier*

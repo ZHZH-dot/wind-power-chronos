@@ -114,14 +114,13 @@ def regularize_hourly_table(resampled: pd.DataFrame, covariates: list[str]) -> p
     regularize_input["id"] = regularize_input["id"].astype(str)
     regularize_input["timestamp"] = pd.to_datetime(regularize_input["timestamp"])
 
-    full_grid = pd.date_range(
-        regularize_input["timestamp"].min(),
-        regularize_input["timestamp"].max(),
-        freq="1h",
-    )
-
     frames: list[pd.DataFrame] = []
     for turbine_id, group in regularize_input.groupby("id", sort=True):
+        full_grid = pd.date_range(
+            group["timestamp"].min(),
+            group["timestamp"].max(),
+            freq="1h",
+        )
         turbine_frame = (
             group.drop_duplicates(subset=["timestamp"], keep="last")
             .set_index("timestamp")
@@ -240,7 +239,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--regularize-hourly",
         action="store_true",
-        help="Fill every turbine onto a complete global hourly timestamp grid for Chronos-2.",
+        help="Fill each turbine onto its own complete hourly timestamp grid for Chronos-2.",
     )
     return parser
 
