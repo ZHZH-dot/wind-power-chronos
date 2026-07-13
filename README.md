@@ -133,7 +133,7 @@ RESULT_DIR=results/zero_shot \
 bash scripts/run_zero_shot_autodl.sh /root/autodl-tmp/<your-sdwpf-file>.csv
 ```
 
-A100 is not required for the zero-shot one-turbine smoke test. A single GPU with sufficient memory is recommended for LoRA fine-tuning; the AutoDL script restricts training to one visible GPU.
+A100 is not required. The fine-tuning launcher targets one NVIDIA RTX 4090 with 24 GB VRAM and restricts training to `CUDA_VISIBLE_DEVICES=0`; it does not use multi-GPU training or `device_map="auto"`.
 
 ## First Smoke Test
 
@@ -223,6 +223,18 @@ Install the AutoDL fine-tuning environment:
 python -m pip install -r requirements-finetune-autodl.txt
 ```
 
+The fine-tuning requirements use `autogluon.timeseries>=1.5,<1.6` with `chronos-forecasting>=2.2.2,<2.4`. This is AutoGluon 1.5's compatible Chronos range and includes the Chronos 2.1.0 fix for past-only covariates.
+
+Run the model-free 4090 preflight before loading Chronos-2. It prints `nvidia-smi`, Python, PyTorch, CUDA, AutoGluon, and Chronos versions, CUDA availability, the visible GPU and VRAM, and BF16 support:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+nvidia-smi
+python scripts/preflight_finetune_4090.py
+```
+
+The launcher selects BF16 when `torch.cuda.is_bf16_supported()` is true and otherwise uses FP16. The initial full-run batch size is 16; `BATCH_SIZE`, `INFERENCE_BATCH_SIZE`, and `DATALOADER_NUM_WORKERS` can override the launcher defaults.
+
 Run a CPU-only data and leakage check. This does not import AutoGluon or load the model:
 
 ```bash
@@ -240,17 +252,34 @@ python -m src.training.chronos_finetune \
   --dry-run
 ```
 
-First GPU smoke fine-tune with one turbine and ten update steps:
+Validate the complete processed dataset without downloading or training the model:
 
 ```bash
-MAX_TURBINES=1 STEPS=10 \
+CUDA_VISIBLE_DEVICES=0 DRY_RUN_ONLY=1 \
+OUTPUT_DIR=results/fine_tune/rtx4090_dry_run \
 bash scripts/run_finetune_autodl.sh \
   data/processed/sdwpf_hourly_regularized.parquet
 ```
 
-Full multivariate LoRA run with the default 1000 steps:
+The dry-run report includes the source and selected turbine counts, hourly-frequency check, exact train/validation/test boundaries, past-covariate columns, imputation-mask counts, leakage check, and output paths.
+
+Next GPU smoke fine-tune with five turbines, 100 update steps, batch size 8, and no data-loader subprocesses:
 
 ```bash
+CUDA_VISIBLE_DEVICES=0 MAX_TURBINES=5 STEPS=100 BATCH_SIZE=8 \
+DATALOADER_NUM_WORKERS=0 \
+OUTPUT_DIR=results/fine_tune/chronos2_lora_multivariate_5t_100s \
+bash scripts/run_finetune_autodl.sh \
+  data/processed/sdwpf_hourly_regularized.parquet
+```
+
+If batch size 8 causes CUDA OOM, rerun with `BATCH_SIZE=4` and a new `OUTPUT_DIR`.
+
+Full multivariate LoRA run with the default 1000 steps and initial batch size 16:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 BATCH_SIZE=16 DATALOADER_NUM_WORKERS=0 \
+OUTPUT_DIR=results/fine_tune/chronos2_lora_multivariate_full \
 bash scripts/run_finetune_autodl.sh \
   data/processed/sdwpf_hourly_regularized.parquet
 ```

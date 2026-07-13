@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: bash scripts/run_finetune_autodl.sh /path/to/sdwpf_hourly_regularized.parquet"
-  echo "Optional env vars: ENV_NAME, MODEL_ID, MODE, COVARIATES, STEPS, LEARNING_RATE, BATCH_SIZE, INFERENCE_BATCH_SIZE, MAX_TURBINES, OUTPUT_DIR, SPLIT_MANIFEST, DRY_RUN_ONLY"
+  echo "Optional env vars: ENV_NAME, MODEL_ID, MODE, COVARIATES, STEPS, LEARNING_RATE, BATCH_SIZE, INFERENCE_BATCH_SIZE, DATALOADER_NUM_WORKERS, MAX_TURBINES, OUTPUT_DIR, SPLIT_MANIFEST, DRY_RUN_ONLY"
   exit 1
 fi
 
@@ -18,14 +18,15 @@ PREDICTION_LENGTH="${PREDICTION_LENGTH:-72}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-168}"
 STEPS="${STEPS:-1000}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
 INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-64}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
 MAX_TURBINES="${MAX_TURBINES:-}"
 SEED="${SEED:-42}"
 DRY_RUN_ONLY="${DRY_RUN_ONLY:-0}"
 RUN_NAME="chronos2_lora_${MODE}_$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="${OUTPUT_DIR:-results/fine_tune/${RUN_NAME}}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES=0
 
 if [[ ! -f "${INPUT}" ]]; then
   echo "Processed SDWPF input does not exist: ${INPUT}"
@@ -44,6 +45,8 @@ conda activate "${ENV_NAME}"
 
 python -m pip install --upgrade pip
 python -m pip install -r requirements-finetune-autodl.txt
+nvidia-smi
+python scripts/preflight_finetune_4090.py
 python -m pytest tests
 
 COMMON_ARGS=(
@@ -59,6 +62,7 @@ COMMON_ARGS=(
   --learning-rate "${LEARNING_RATE}"
   --batch-size "${BATCH_SIZE}"
   --inference-batch-size "${INFERENCE_BATCH_SIZE}"
+  --dataloader-num-workers "${DATALOADER_NUM_WORKERS}"
   --seed "${SEED}"
 )
 

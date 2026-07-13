@@ -17,6 +17,7 @@ from src.training.chronos_finetune import (
     prepare_finetune_frames,
     resolve_split_manifest,
     run,
+    select_training_precision,
     validate_and_normalize_data,
 )
 
@@ -49,8 +50,9 @@ def test_cli_defaults_are_chronos2_lora_defaults() -> None:
     assert args.context_length == 168
     assert args.steps == 1000
     assert args.learning_rate == pytest.approx(1e-5)
-    assert args.batch_size == 32
+    assert args.batch_size == 16
     assert args.inference_batch_size == 64
+    assert args.dataloader_num_workers == 0
     assert args.seed == 42
 
 
@@ -118,6 +120,8 @@ def test_hyperparameters_enable_only_chronos2_lora() -> None:
         batch_size=32,
         inference_batch_size=64,
         seed=42,
+        dataloader_num_workers=0,
+        bf16=True,
     )
 
     assert list(hyperparameters) == ["Chronos2"]
@@ -129,6 +133,17 @@ def test_hyperparameters_enable_only_chronos2_lora() -> None:
     assert chronos["disable_past_covariates"] is False
     assert chronos["fine_tune_batch_size"] == 32
     assert chronos["batch_size"] == 64
+    assert chronos["fine_tune_trainer_kwargs"]["dataloader_num_workers"] == 0
+    assert chronos["fine_tune_trainer_kwargs"]["bf16"] is True
+    assert chronos["fine_tune_trainer_kwargs"]["fp16"] is False
+    assert chronos["fine_tune_trainer_kwargs"]["disable_data_parallel"] is True
+
+
+def test_training_precision_prefers_bf16_and_falls_back_to_fp16() -> None:
+    assert select_training_precision(True, True) == ("bf16", True, False)
+    assert select_training_precision(True, False) == ("fp16", False, True)
+    with pytest.raises(RuntimeError, match="CUDA GPU"):
+        select_training_precision(False, False)
 
 
 def test_dry_run_does_not_create_or_load_predictor(tmp_path: Path) -> None:
@@ -158,6 +173,8 @@ def test_dry_run_does_not_create_or_load_predictor(tmp_path: Path) -> None:
     summary = run(args)
 
     assert summary["dry_run"] is True
+    assert summary["precision"] == "deferred_until_gpu_training"
+    assert summary["temporal_leakage_check"] == "passed"
     assert not (output_dir / "predictor").exists()
     assert (output_dir / "resolved_split_manifest.json").exists()
     assert (output_dir / "run_config.json").exists()
@@ -224,8 +241,14 @@ def test_autogluon_fit_receives_train_and_cumulative_validation_only(tmp_path: P
 
 def test_autodl_script_has_cpu_dry_run_before_training() -> None:
     script = Path("scripts/run_finetune_autodl.sh").read_text(encoding="utf-8")
+    requirements = Path("requirements-autodl.txt").read_text(encoding="utf-8")
 
     assert "requirements-finetune-autodl.txt" in script
     assert "python -m pytest tests" in script
     assert '"${COMMON_ARGS[@]}" --dry-run' in script
     assert "CUDA_VISIBLE_DEVICES" in script
+    assert 'BATCH_SIZE="${BATCH_SIZE:-16}"' in script
+    assert 'DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"' in script
+    assert "python scripts/preflight_finetune_4090.py" in script
+    assert "nvidia-smi" in script
+    assert "chronos-forecasting>=2.2.2,<2.4" in requirements

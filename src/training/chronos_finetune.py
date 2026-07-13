@@ -79,6 +79,27 @@ def validate_model_id(model_id: str) -> str:
     return str(local_path)
 
 
+def select_training_precision(
+    cuda_available: bool,
+    bf16_supported: bool,
+) -> tuple[str, bool, bool]:
+    """Select mixed precision without initializing CUDA during dry runs."""
+    if not cuda_available:
+        raise RuntimeError("Chronos-2 fine-tuning requires a CUDA GPU.")
+    if bf16_supported:
+        return "bf16", True, False
+    return "fp16", False, True
+
+
+def detect_training_precision() -> tuple[str, bool, bool]:
+    import torch
+
+    return select_training_precision(
+        cuda_available=torch.cuda.is_available(),
+        bf16_supported=torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False,
+    )
+
+
 def validate_and_normalize_data(
     data: pd.DataFrame,
     mode: str,
@@ -224,11 +245,18 @@ def build_chronos2_hyperparameters(
     batch_size: int,
     inference_batch_size: int,
     seed: int,
+    dataloader_num_workers: int = 0,
+    bf16: bool = False,
+    fp16: bool = False,
 ) -> dict[str, dict[str, Any]]:
     if min(prediction_length, context_length, steps, batch_size, inference_batch_size) <= 0:
         raise ValueError("Lengths, steps, and batch sizes must be positive.")
     if learning_rate <= 0:
         raise ValueError("--learning-rate must be positive.")
+    if dataloader_num_workers < 0:
+        raise ValueError("--dataloader-num-workers must be non-negative.")
+    if bf16 and fp16:
+        raise ValueError("BF16 and FP16 cannot both be enabled.")
 
     return {
         "Chronos2": {
@@ -245,7 +273,14 @@ def build_chronos2_hyperparameters(
             "eval_during_fine_tune": True,
             "disable_known_covariates": True,
             "disable_past_covariates": mode == "univariate",
-            "fine_tune_trainer_kwargs": {"seed": seed, "data_seed": seed},
+            "fine_tune_trainer_kwargs": {
+                "seed": seed,
+                "data_seed": seed,
+                "dataloader_num_workers": dataloader_num_workers,
+                "bf16": bf16,
+                "fp16": fp16,
+                "disable_data_parallel": True,
+            },
             "ag_args": {"name_suffix": "LoRA"},
         }
     }
@@ -315,6 +350,8 @@ def write_run_config(
     manifest: dict[str, Any],
     frames: FineTuneFrames,
     hyperparameters: dict[str, dict[str, Any]],
+    data_summary: dict[str, Any],
+    precision: str,
 ) -> None:
     run_config = {
         "input": str(args.input),
@@ -327,6 +364,8 @@ def write_run_config(
         "context_length": args.context_length,
         "quantile_levels": QUANTILE_LEVELS,
         "seed": args.seed,
+        "dataloader_num_workers": args.dataloader_num_workers,
+        "precision": precision,
         "dry_run": args.dry_run,
         "split": manifest["splits"],
         "split_strategy": split_config["split_strategy"],
@@ -336,6 +375,7 @@ def write_run_config(
         "n_masked_imputed_train": frames.n_masked_imputed_train,
         "n_masked_imputed_validation": frames.n_masked_imputed_validation,
         "test_data_passed_to_fit": False,
+        "data_validation": data_summary,
         "hyperparameters": hyperparameters,
     }
     with (output_dir / "run_config.json").open("w", encoding="utf-8") as file:
@@ -356,6 +396,18 @@ def run(args: argparse.Namespace, autogluon_classes: tuple[Any, Any] | None = No
         covariates=covariates,
         frequency=str(split_config["frequency"]),
     )
+    data_summary = {
+        "input_path": str(Path(args.input).resolve()),
+        "n_rows": len(data),
+        "n_turbines": int(data["id"].nunique()),
+        "frequency": str(split_config["frequency"]),
+        "timestamps_regular": True,
+        "target_column": "target",
+        "past_covariate_columns": covariates if args.mode == "multivariate" else [],
+        "known_future_covariate_columns": [],
+        "imputation_mask_column": "is_imputed_target",
+        "n_imputed_targets": int(data["is_imputed_target"].sum()),
+    }
     manifest = resolve_split_manifest(
         data,
         split_config=split_config,
@@ -371,6 +423,11 @@ def run(args: argparse.Namespace, autogluon_classes: tuple[Any, Any] | None = No
         context_length=args.context_length,
         max_turbines=args.max_turbines,
     )
+    if args.dry_run:
+        precision, bf16, fp16 = "deferred_until_gpu_training", False, False
+    else:
+        precision, bf16, fp16 = detect_training_precision()
+
     hyperparameters = build_chronos2_hyperparameters(
         model_id=args.model_id,
         mode=args.mode,
@@ -381,17 +438,43 @@ def run(args: argparse.Namespace, autogluon_classes: tuple[Any, Any] | None = No
         batch_size=args.batch_size,
         inference_batch_size=args.inference_batch_size,
         seed=args.seed,
+        dataloader_num_workers=args.dataloader_num_workers,
+        bf16=bf16,
+        fp16=fp16,
     )
-    write_run_config(output_dir, args, split_config, manifest, frames, hyperparameters)
+    write_run_config(
+        output_dir,
+        args,
+        split_config,
+        manifest,
+        frames,
+        hyperparameters,
+        data_summary,
+        precision,
+    )
 
     summary = {
-        "output_dir": str(output_dir),
+        "input_path": data_summary["input_path"],
+        "output_dir": str(output_dir.resolve()),
+        "source_turbines": data_summary["n_turbines"],
         "n_turbines": len(frames.turbine_ids),
         "n_train_rows": len(frames.train),
         "n_validation_context_rows": len(frames.validation_context),
         "train_end": manifest["splits"]["train"]["end"],
         "validation_end": manifest["splits"]["validation"]["end"],
         "test_start": manifest["splits"]["test"]["start"],
+        "test_end": manifest["splits"]["test"]["end"],
+        "frequency": data_summary["frequency"],
+        "timestamps_regular": True,
+        "target_column": "target",
+        "past_covariate_columns": data_summary["past_covariate_columns"],
+        "known_future_covariate_columns": [],
+        "n_imputed_targets": data_summary["n_imputed_targets"],
+        "n_masked_imputed_train": frames.n_masked_imputed_train,
+        "n_masked_imputed_validation": frames.n_masked_imputed_validation,
+        "test_data_passed_to_fit": False,
+        "temporal_leakage_check": "passed",
+        "precision": precision,
         "dry_run": bool(args.dry_run),
     }
     if not args.dry_run:
@@ -425,8 +508,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--context-length", default=168, type=int)
     parser.add_argument("--steps", default=1000, type=int)
     parser.add_argument("--learning-rate", default=1e-5, type=float)
-    parser.add_argument("--batch-size", default=32, type=int)
+    parser.add_argument("--batch-size", default=16, type=int)
     parser.add_argument("--inference-batch-size", default=64, type=int)
+    parser.add_argument("--dataloader-num-workers", default=0, type=int)
     parser.add_argument("--max-turbines", "--max_turbines", dest="max_turbines", type=int)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--dry-run", action="store_true")
