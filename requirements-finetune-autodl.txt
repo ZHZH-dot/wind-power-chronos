@@ -1,0 +1,4 @@
+-r requirements-autodl.txt
+autogluon.timeseries>=1.5,<1.6
+accelerate
+peft

@@ -1,0 +1,12 @@
+{
+  "name": "sdwpf_70_10_20",
+  "split_strategy": "global_chronological_timestamp",
+  "train_ratio": 0.70,
+  "validation_ratio": 0.10,
+  "test_ratio": 0.20,
+  "prediction_length": 72,
+  "context_length": 168,
+  "horizons": [1, 6, 24, 72],
+  "frequency": "1h",
+  "random_seed": 42
+}

@@ -7,7 +7,10 @@ __pycache__/
 data/raw/
 data/processed/
 data/external/
-results/
+results/*
+!results/fine_tune/
+results/fine_tune/*
+!results/fine_tune/.gitkeep
 experiments/
 # SDWPF dataset files
 src/data/raw/SDWPF/

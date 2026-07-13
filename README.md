@@ -1,8 +1,8 @@
 # Wind Power Chronos MVP
 
-Production-oriented SDWPF wind power forecasting MVP using Chronos-2 zero-shot inference.
+Production-oriented SDWPF wind power forecasting MVP using Chronos-2 zero-shot inference and LoRA fine-tuning.
 
-This stage is inference only. There is no fine-tuning or training code in the first pipeline.
+Zero-shot remains the benchmark baseline. Fine-tuning uses AutoGluon TimeSeries with the Chronos-2 model only.
 
 ## Model Constraint
 
@@ -12,6 +12,12 @@ Use Chronos-2 only:
 from chronos import Chronos2Pipeline
 
 Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map="cuda")
+```
+
+LoRA fine-tuning uses:
+
+```python
+from autogluon.timeseries import TimeSeriesDataFrame, TimeSeriesPredictor
 ```
 
 The default `--model-id` is `amazon/chronos-2`. The same argument can also be a local model directory such as `/data/GDUT_stu/models/chronos-2`. The legacy spelling `--model_id` is still accepted. The excluded model families are not part of this repository.
@@ -127,7 +133,7 @@ RESULT_DIR=results/zero_shot \
 bash scripts/run_zero_shot_autodl.sh /root/autodl-tmp/<your-sdwpf-file>.csv
 ```
 
-A100 is not required for the one-turbine smoke test. It is useful for full SDWPF evaluation and later fine-tuning work, but fine-tuning is not implemented in this stage.
+A100 is not required for the zero-shot one-turbine smoke test. A single GPU with sufficient memory is recommended for LoRA fine-tuning; the AutoDL script restricts training to one visible GPU.
 
 ## First Smoke Test
 
@@ -202,6 +208,71 @@ python -m src.evaluation.evaluate \
 Evaluation excludes `is_imputed_target == True` rows unless `--include-imputed-targets` is explicitly supplied for diagnostics. It reports `n_scored`, `n_excluded_imputed`, MAE, RMSE, mean bias, `nmae_capacity`, and `nrmse_capacity`. A `rated_capacity_kw` column is used when present; otherwise SDWPF defaults to 1500 kW through `--rated-capacity-kw`.
 
 Prediction files preserve Chronos-2 `p10`, `p50`, and `p90`; `y_pred` remains an alias for `p50`. Point metrics use `p50`. Probabilistic metrics include pinball loss at each quantile, mean pinball loss, P10-P90 interval coverage, and mean interval width.
+
+## Chronos-2 LoRA Fine-Tuning
+
+Fine-tuning reuses the same global chronological benchmark. `configs/splits/sdwpf_70_10_20.json` defines the 70% train, 10% validation, and 20% test ratios plus the 72-hour prediction length, 168-hour context, benchmark horizons, hourly frequency, and seed 42.
+
+Only timestamps through the train boundary are passed as `train_data`. AutoGluon receives cumulative data through the validation boundary as `tuning_data`, which provides historical context for validation without exposing test targets. The resolved boundaries are copied to `<output-dir>/resolved_split_manifest.json`. If `--split-manifest` is supplied, it must match the input data and is reused exactly.
+
+Measured SDWPF covariates are treated as past-only covariates. Regularized rows remain present, but targets marked `is_imputed_target` are masked as missing supervision. The training script never produces or scores test forecasts; subsequent model comparison must use the existing test-window and evaluation functions.
+
+Install the AutoDL fine-tuning environment:
+
+```bash
+python -m pip install -r requirements-finetune-autodl.txt
+```
+
+Run a CPU-only data and leakage check. This does not import AutoGluon or load the model:
+
+```bash
+python -m src.training.chronos_finetune \
+  --input data/processed/sdwpf_hourly_regularized.parquet \
+  --split-config configs/splits/sdwpf_70_10_20.json \
+  --split-manifest data/processed/sdwpf_split_manifest.json \
+  --output-dir results/fine_tune/dry_run \
+  --model-id amazon/chronos-2 \
+  --mode multivariate \
+  --covariates Wspd,Wdir,Etmp,Itmp,Ndir,Pab1,Pab2,Pab3,Prtv \
+  --prediction-length 72 \
+  --context-length 168 \
+  --max-turbines 1 \
+  --dry-run
+```
+
+First GPU smoke fine-tune with one turbine and ten update steps:
+
+```bash
+MAX_TURBINES=1 STEPS=10 \
+bash scripts/run_finetune_autodl.sh \
+  data/processed/sdwpf_hourly_regularized.parquet
+```
+
+Full multivariate LoRA run with the default 1000 steps:
+
+```bash
+bash scripts/run_finetune_autodl.sh \
+  data/processed/sdwpf_hourly_regularized.parquet
+```
+
+Use a local Chronos-2 directory when Hugging Face access is unavailable:
+
+```bash
+MODEL_ID=/data/GDUT_stu/models/chronos-2 \
+OUTPUT_DIR=results/fine_tune/chronos2_lora_multivariate_local \
+bash scripts/run_finetune_autodl.sh \
+  data/processed/sdwpf_hourly_regularized.parquet
+```
+
+Univariate LoRA uses the same split and simply omits past covariates:
+
+```bash
+MODE=univariate OUTPUT_DIR=results/fine_tune/chronos2_lora_univariate \
+bash scripts/run_finetune_autodl.sh \
+  data/processed/sdwpf_hourly_regularized.parquet
+```
+
+Each run writes `run_config.json`, `resolved_split_manifest.json`, and the AutoGluon predictor under its output directory. The script refuses to overwrite an existing output directory.
 
 ## If Hugging Face Is Unavailable
 

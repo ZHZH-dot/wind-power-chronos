@@ -15,6 +15,26 @@ DEFAULT_BENCHMARK_CONFIG = Path("configs/sdwpf_benchmark.json")
 DEFAULT_SPLIT_MANIFEST = Path("data/processed/sdwpf_split_manifest.json")
 
 
+def _normalize_split_ratios(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = config.copy()
+    for split_name in ("train", "validation", "test"):
+        fraction_key = f"{split_name}_fraction"
+        ratio_key = f"{split_name}_ratio"
+        fraction = normalized.get(fraction_key)
+        ratio = normalized.get(ratio_key)
+        if fraction is None and ratio is None:
+            raise ValueError(
+                f"Benchmark config must define {fraction_key} or {ratio_key}."
+            )
+        if fraction is not None and ratio is not None and not math.isclose(
+            float(fraction),
+            float(ratio),
+        ):
+            raise ValueError(f"{fraction_key} and {ratio_key} must match.")
+        normalized[fraction_key] = float(fraction if fraction is not None else ratio)
+    return normalized
+
+
 def read_table(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".csv":
         return pd.read_csv(path)
@@ -25,17 +45,12 @@ def load_benchmark_config(path: Path = DEFAULT_BENCHMARK_CONFIG) -> dict[str, An
     with path.open("r", encoding="utf-8") as file:
         config = json.load(file)
 
-    required = {
-        "name",
-        "frequency",
-        "split_strategy",
-        "train_fraction",
-        "validation_fraction",
-        "test_fraction",
-    }
+    required = {"name", "frequency", "split_strategy"}
     missing = sorted(required - set(config))
     if missing:
         raise ValueError(f"Benchmark config is missing fields: {missing}")
+
+    config = _normalize_split_ratios(config)
 
     fractions = [
         float(config["train_fraction"]),
@@ -108,6 +123,27 @@ def write_split_manifest(manifest: dict[str, Any], path: Path) -> None:
         file.write("\n")
 
 
+def load_split_manifest(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def validate_split_manifest(
+    manifest: dict[str, Any],
+    timestamps: Iterable[object],
+    config: dict[str, Any],
+) -> None:
+    """Verify that a resolved manifest uses the same data boundaries and split ratios."""
+    expected = build_split_manifest(timestamps, _normalize_split_ratios(config))
+    comparable_keys = ("strategy", "frequency", "fractions", "global", "splits")
+    mismatched = [key for key in comparable_keys if manifest.get(key) != expected.get(key)]
+    if mismatched:
+        raise ValueError(
+            "Resolved split manifest does not match the input data/config for fields: "
+            f"{mismatched}"
+        )
+
+
 def ensure_split_manifest(
     data: pd.DataFrame,
     config_path: Path = DEFAULT_BENCHMARK_CONFIG,
@@ -121,13 +157,8 @@ def ensure_split_manifest(
     config = load_benchmark_config(config_path)
     expected = build_split_manifest(data["timestamp"], config)
     if manifest_path.exists() and not overwrite:
-        with manifest_path.open("r", encoding="utf-8") as file:
-            existing = json.load(file)
-        if existing != expected:
-            raise ValueError(
-                f"Existing split manifest {manifest_path} does not match the input data/config. "
-                "Create a new manifest path or regenerate it explicitly."
-            )
+        existing = load_split_manifest(manifest_path)
+        validate_split_manifest(existing, data["timestamp"], config)
         return existing
 
     write_split_manifest(expected, manifest_path)

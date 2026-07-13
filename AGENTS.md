@@ -6,17 +6,24 @@ We are building a production-oriented wind power forecasting MVP using Chronos-2
 
 The project is mainly multivariate / covariate-informed wind power forecasting.
 
-The current task is zero-shot inference only. Do not implement fine-tuning unless explicitly asked.
+The Forecasting Agent supports Chronos-2 zero-shot inference and Chronos-2 LoRA fine-tuning through AutoGluon TimeSeries. Do not add other agents or forecasting model families unless explicitly asked.
 
 ## Model rule
 
 Use Chronos-2 only for this stage.
 
-Required:
+Required for zero-shot inference:
 - package: chronos-forecasting
 - import: `from chronos import Chronos2Pipeline`
 - model id: `amazon/chronos-2`
 - loading style: `Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map="cuda")`
+
+Required for fine-tuning:
+- package: `autogluon.timeseries`
+- imports: `TimeSeriesDataFrame`, `TimeSeriesPredictor`
+- AutoGluon model key: `Chronos2`
+- base model: `amazon/chronos-2` or a user-provided local Chronos-2 directory
+- fine-tuning mode: LoRA
 
 Do not use:
 - original Chronos T5 models
@@ -36,7 +43,7 @@ Follow this structure:
 - `data/external/`: optional external data such as NWP
 - `src/data/`: dataset loading and preprocessing
 - `src/models/`: model wrappers and inference code
-- `src/training/`: training or fine-tuning logic; leave mostly empty for zero-shot
+- `src/training/`: Chronos-2 LoRA fine-tuning logic
 - `src/evaluation/`: metrics and evaluation scripts
 - `src/utils/`: shared utilities
 - `notebooks/`: exploratory analysis only
@@ -116,12 +123,20 @@ The first experiment should:
    - univariate zero-shot
    - multivariate/covariate-informed zero-shot
 8. Save predictions.
-9. Compute:
-   - MAE
-   - RMSE
-   - NMAE
-   - NRMSE
+9. Compute point, capacity-normalized, bias, pinball, and interval metrics with imputed targets excluded by default.
 10. Produce a simple result table comparing univariate vs multivariate mode.
+
+## Fine-tuning rules
+
+- Reuse the global chronological timestamp split and resolved manifest from evaluation.
+- Train only on the first 70% of global timestamps.
+- Use cumulative data through the validation boundary as validation context.
+- Never pass test targets to AutoGluon `fit`, tuning, checkpoint selection, or refit.
+- Preserve hourly rows and mask `is_imputed_target` rows as missing supervision.
+- Treat measured SDWPF covariates as past-only covariates.
+- Use only the AutoGluon `Chronos2` model with `fine_tune_mode="lora"` and ensembles disabled.
+- Dry runs and unit tests must not import AutoGluon, load Chronos-2, or require a GPU.
+- Save fine-tuning outputs under `results/fine_tune/` and never overwrite an existing predictor.
 
 ## Acceptance criteria
 
@@ -137,3 +152,6 @@ The task is finished only if:
 - The default model is Chronos-2, not Chronos-Bolt or original Chronos.
 - The code supports a `--covariates` argument or YAML config field.
 - The README includes both univariate and multivariate examples.
+- `src/training/chronos_finetune.py` supports CPU-only `--dry-run` validation.
+- `configs/splits/sdwpf_70_10_20.json` defines the shared fine-tuning split contract.
+- `scripts/run_finetune_autodl.sh` runs tests and a dry run before GPU fine-tuning.
