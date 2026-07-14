@@ -55,24 +55,24 @@ class FakePredictor:
         )
 
 
-def _data(periods: int = 20) -> pd.DataFrame:
+def _data(periods: int = 20, turbine_count: int = 5) -> pd.DataFrame:
     timestamps = pd.date_range("2020-01-01", periods=periods, freq="1h")
     rows: list[dict[str, object]] = []
-    for turbine_id in ("2", "1", "5", "3", "4"):
+    for turbine_id in reversed(range(1, turbine_count + 1)):
         for index, timestamp in enumerate(timestamps):
             rows.append(
                 {
-                    "id": turbine_id,
+                    "id": str(turbine_id),
                     "timestamp": timestamp,
                     "target": float(index),
                     "Wspd": float(index + 1),
-                    "is_imputed_target": index == 16 and turbine_id == "1",
+                    "is_imputed_target": index == 16 and turbine_id == 1,
                 }
             )
     return pd.DataFrame(rows)
 
 
-def _saved_run(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _saved_run(tmp_path: Path, turbine_count: int = 5) -> tuple[Path, Path, Path]:
     predictor_path = tmp_path / "run" / "predictor"
     checkpoint = (
         predictor_path
@@ -85,7 +85,7 @@ def _saved_run(tmp_path: Path) -> tuple[Path, Path, Path]:
     checkpoint.write_bytes(b"fake")
 
     input_path = tmp_path / "sdwpf.csv"
-    data = _data()
+    data = _data(turbine_count=turbine_count)
     data.to_csv(input_path, index=False)
     config = load_benchmark_config(Path("configs/splits/sdwpf_70_10_20.json"))
     manifest = build_split_manifest(data["timestamp"], config)
@@ -96,7 +96,7 @@ def _saved_run(tmp_path: Path) -> tuple[Path, Path, Path]:
         "mode": "multivariate",
         "prediction_length": 2,
         "context_length": 4,
-        "n_turbines": 5,
+        "n_turbines": turbine_count,
         "covariates": ["Wspd"],
         "quantile_levels": [0.1, 0.5, 0.9],
         "hyperparameters": {
@@ -114,39 +114,54 @@ def _saved_run(tmp_path: Path) -> tuple[Path, Path, Path]:
     return predictor_path, input_path, manifest_path
 
 
+def _evaluation_args(
+    predictor_path: Path,
+    input_path: Path,
+    manifest_path: Path,
+    output_dir: Path,
+    max_turbines: int | None = None,
+) -> object:
+    values = [
+        "--predictor-path",
+        str(predictor_path),
+        "--input",
+        str(input_path),
+        "--split-manifest",
+        str(manifest_path),
+        "--output",
+        str(output_dir / "predictions.csv"),
+        "--metrics-output",
+        str(output_dir / "metrics.csv"),
+        "--metadata-output",
+        str(output_dir / "metadata.json"),
+        "--covariates",
+        "Wspd",
+        "--prediction-length",
+        "2",
+        "--context-length",
+        "4",
+        "--horizons",
+        "1",
+        "2",
+        "--max-windows-per-turbine",
+        "1",
+    ]
+    if max_turbines is not None:
+        values.extend(["--max-turbines", str(max_turbines)])
+    return build_arg_parser().parse_args(values)
+
+
 def test_saved_predictor_uses_existing_rolling_protocol(tmp_path: Path) -> None:
     predictor_path, input_path, manifest_path = _saved_run(tmp_path)
     predictions_path = tmp_path / "predictions.csv"
     metrics_path = tmp_path / "metrics.csv"
     metadata_path = tmp_path / "metadata.json"
-    args = build_arg_parser().parse_args(
-        [
-            "--predictor-path",
-            str(predictor_path),
-            "--input",
-            str(input_path),
-            "--split-manifest",
-            str(manifest_path),
-            "--output",
-            str(predictions_path),
-            "--metrics-output",
-            str(metrics_path),
-            "--metadata-output",
-            str(metadata_path),
-            "--covariates",
-            "Wspd",
-            "--prediction-length",
-            "2",
-            "--context-length",
-            "4",
-            "--horizons",
-            "1",
-            "2",
-            "--max-turbines",
-            "5",
-            "--max-windows-per-turbine",
-            "1",
-        ]
+    args = _evaluation_args(
+        predictor_path,
+        input_path,
+        manifest_path,
+        tmp_path,
+        max_turbines=5,
     )
 
     metadata = run(args, autogluon_classes=(FakeTimeSeriesDataFrame, FakePredictor))
@@ -154,6 +169,8 @@ def test_saved_predictor_uses_existing_rolling_protocol(tmp_path: Path) -> None:
     metrics = pd.read_csv(metrics_path)
 
     assert metadata["selected_turbine_ids"] == ["1", "2", "3", "4", "5"]
+    assert metadata["saved_expected_turbine_count"] == 5
+    assert metadata["requested_max_turbines"] == 5
     assert metadata["known_future_covariates"] == []
     assert len(predictions) == 10
     assert list(predictions.columns) == [
@@ -184,6 +201,38 @@ def test_saved_predictor_uses_existing_rolling_protocol(tmp_path: Path) -> None:
         context = call["data"]
         assert list(context.columns) == ["id", "timestamp", "target", "Wspd"]
         assert pd.Timestamp(call["cutoff"]) == pd.Timestamp("2020-01-01 15:00")
+
+
+def test_full_134_turbine_predictor_uses_saved_count(tmp_path: Path) -> None:
+    predictor_path, input_path, manifest_path = _saved_run(tmp_path, turbine_count=134)
+    args = _evaluation_args(
+        predictor_path,
+        input_path,
+        manifest_path,
+        tmp_path,
+    )
+
+    metadata = run(args, autogluon_classes=(FakeTimeSeriesDataFrame, FakePredictor))
+
+    assert metadata["saved_expected_turbine_count"] == 134
+    assert metadata["n_turbines"] == 134
+    assert len(metadata["selected_turbine_ids"]) == 134
+    assert FakePredictor.loaded is not None
+    assert len(FakePredictor.loaded.calls) == 134
+
+
+def test_cli_turbine_count_must_match_saved_run(tmp_path: Path) -> None:
+    predictor_path, input_path, manifest_path = _saved_run(tmp_path, turbine_count=134)
+    args = _evaluation_args(
+        predictor_path,
+        input_path,
+        manifest_path,
+        tmp_path,
+        max_turbines=5,
+    )
+
+    with pytest.raises(ValueError, match=r"--max-turbines=5.*n_turbines=134"):
+        run(args, autogluon_classes=(FakeTimeSeriesDataFrame, FakePredictor))
 
 
 def test_adapter_rejects_known_future_covariates() -> None:

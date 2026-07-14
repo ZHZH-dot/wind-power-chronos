@@ -91,25 +91,18 @@ def load_verified_predictor(
 
 
 def validate_saved_run_config(
-    run_config_path: Path,
+    config: dict[str, Any],
     prediction_length: int,
     context_length: int,
     inference_batch_size: int,
     mode: str,
     covariates: list[str],
-    n_turbines: int,
 ) -> dict[str, Any]:
-    if not run_config_path.is_file():
-        raise FileNotFoundError(f"Saved fine-tuning run config does not exist: {run_config_path}")
-    with run_config_path.open("r", encoding="utf-8") as file:
-        config = json.load(file)
-
     chronos = config.get("hyperparameters", {}).get("Chronos2", {})
     expected = {
         "mode": mode,
         "prediction_length": prediction_length,
         "context_length": context_length,
-        "n_turbines": n_turbines,
     }
     mismatches = {
         key: {"expected": value, "saved": config.get(key)}
@@ -144,6 +137,20 @@ def validate_saved_run_config(
     if mismatches:
         raise ValueError(f"Saved predictor configuration does not match evaluation: {mismatches}")
     return config
+
+
+def load_saved_run_config(run_config_path: Path) -> tuple[dict[str, Any], int]:
+    if not run_config_path.is_file():
+        raise FileNotFoundError(f"Saved fine-tuning run config does not exist: {run_config_path}")
+    with run_config_path.open("r", encoding="utf-8") as file:
+        config = json.load(file)
+
+    expected_turbines = config.get("n_turbines")
+    if not isinstance(expected_turbines, int) or expected_turbines <= 0:
+        raise ValueError(
+            "Saved fine-tuning run config must contain a positive integer n_turbines."
+        )
+    return config, expected_turbines
 
 
 class AutoGluonChronos2Adapter:
@@ -205,8 +212,22 @@ def run(
     horizons = parse_int_list(args.horizons)
     if max(horizons) != args.prediction_length:
         raise ValueError("The maximum evaluated horizon must equal --prediction-length.")
-    if args.max_turbines != 5:
-        raise ValueError("This smoke predictor must be evaluated on the same five turbines used to train it.")
+
+    run_config, expected_turbines = load_saved_run_config(run_config_path)
+    if args.max_turbines is not None and args.max_turbines != expected_turbines:
+        raise ValueError(
+            f"--max-turbines={args.max_turbines} does not match the saved run "
+            f"configuration n_turbines={expected_turbines}."
+        )
+    turbine_limit = expected_turbines
+    validate_saved_run_config(
+        run_config,
+        prediction_length=args.prediction_length,
+        context_length=args.context_length,
+        inference_batch_size=args.inference_batch_size,
+        mode=args.mode,
+        covariates=covariates,
+    )
 
     split_config = load_benchmark_config(Path(args.split_config))
     data = validate_and_normalize_data(
@@ -224,22 +245,14 @@ def run(
         covariates=covariates,
         prediction_length=args.prediction_length,
         context_length=args.context_length,
-        max_turbines=args.max_turbines,
+        max_turbines=turbine_limit,
     )
     selected_ids = frames.turbine_ids
-    if len(selected_ids) != 5:
+    if len(selected_ids) != expected_turbines:
         raise ValueError(
-            f"Expected the five smoke-training turbines, but selection produced {selected_ids}."
+            f"Saved run expects {expected_turbines} turbines, but deterministic selection "
+            f"produced {len(selected_ids)}: {selected_ids}."
         )
-    validate_saved_run_config(
-        run_config_path,
-        prediction_length=args.prediction_length,
-        context_length=args.context_length,
-        inference_batch_size=args.inference_batch_size,
-        mode=args.mode,
-        covariates=covariates,
-        n_turbines=len(selected_ids),
-    )
 
     if autogluon_classes is None:
         dataframe_class, predictor_class = _load_autogluon()
@@ -290,6 +303,8 @@ def run(
         "input": str(Path(args.input).resolve()),
         "split_config": str(Path(args.split_config).resolve()),
         "split_manifest": str(split_manifest_path.resolve()),
+        "saved_expected_turbine_count": expected_turbines,
+        "requested_max_turbines": args.max_turbines,
         "selected_turbine_ids": selected_ids,
         "n_turbines": len(selected_ids),
         "mode": args.mode,
@@ -335,7 +350,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizons", nargs="+", default=DEFAULT_HORIZONS)
     parser.add_argument("--inference-batch-size", default=64, type=int)
     parser.add_argument("--stride", default=24, type=int)
-    parser.add_argument("--max-turbines", default=5, type=int)
+    parser.add_argument(
+        "--max-turbines",
+        default=None,
+        type=int,
+        help="Optional guard; when set, it must equal n_turbines in the saved run config.",
+    )
     parser.add_argument("--max-windows-per-turbine", default=None, type=int)
     parser.add_argument("--rated-capacity-kw", default=1500.0, type=float)
     parser.add_argument("--include-imputed-targets", action="store_true")
