@@ -10,7 +10,7 @@
   "inference_batch_size": 64,
   "origin_stride_steps": 96,
   "issue_time": "00:00",
-  "causal_fill_limit": 2,
+  "causal_fill_limit": 3,
   "pv_capacity_kw": 1700.0,
   "pv_active_threshold_kw": 1.0,
   "selection_period": {

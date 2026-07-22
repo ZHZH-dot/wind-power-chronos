@@ -520,6 +520,8 @@ def _bool_series(values: pd.Series) -> pd.Series:
 
 
 def _metric_row(group: pd.DataFrame, pv_active_threshold_kw: float) -> dict[str, Any]:
+    issue_times = pd.to_datetime(group["issue_time"], errors="raise", utc=True)
+    forecast_origins = sorted({timestamp.isoformat() for timestamp in issue_times})
     missing = _bool_series(group["is_missing_target"])
     point_values = group.loc[~missing].copy()
     finite = np.isfinite(pd.to_numeric(point_values["y_true"], errors="coerce")) & np.isfinite(
@@ -537,6 +539,8 @@ def _metric_row(group: pd.DataFrame, pv_active_threshold_kw: float) -> dict[str,
     probabilistic = point_values.dropna(subset=["y_true", "p10", "p50", "p90"])
     has_probabilistic = not probabilistic.empty
     return {
+        "n_origins": len(forecast_origins),
+        "forecast_origin_set": "|".join(forecast_origins),
         "n_scored": int(len(scored)),
         "n_excluded_missing": int(missing.sum()),
         "mae": mae(actual, prediction),
@@ -624,6 +628,22 @@ def select_may_configurations(metrics: pd.DataFrame) -> dict[str, Any]:
         else:
             candidates = candidates[candidates["postprocessing"] == "raw"]
             order = ["wape", "mae", "model_name", "context_length"]
+        required_coverage = {"n_origins", "forecast_origin_set"}
+        missing_coverage = sorted(required_coverage - set(candidates.columns))
+        if not candidates.empty and missing_coverage:
+            raise ValueError(
+                "May selection metrics are missing forecast-origin coverage columns: "
+                f"{missing_coverage}"
+            )
+        coverage = candidates[["n_origins", "forecast_origin_set"]].drop_duplicates()
+        if len(coverage) > 1:
+            details = candidates[
+                ["model_name", "context_length", "n_origins", "forecast_origin_set"]
+            ].drop_duplicates()
+            raise ValueError(
+                f"Cannot compare {target} candidates with different forecast-origin sets: "
+                f"{details.to_dict(orient='records')}"
+            )
         candidates = candidates.dropna(subset=["wape"])
         if candidates.empty:
             continue

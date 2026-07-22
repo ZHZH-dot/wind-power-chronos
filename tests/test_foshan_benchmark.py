@@ -364,6 +364,8 @@ def test_selection_rejects_june_metrics_and_uses_deterministic_may_tie_break() -
             "model_id": ["amazon/chronos-2", "amazon/chronos-2"],
             "context_length": [672, 672],
             "postprocessing": ["physical_clip_0_1700", "physical_clip_0_1700"],
+            "n_origins": [31, 31],
+            "forecast_origin_set": ["may-origins", "may-origins"],
             "wape": [0.2, 0.2],
             "pv_active_mae": [10.0, 11.0],
             "mae": [9.0, 9.0],
@@ -377,3 +379,24 @@ def test_selection_rejects_june_metrics_and_uses_deterministic_may_tie_break() -
     june["split"] = "june_2026_test"
     with pytest.raises(ValueError, match="May metrics only"):
         select_may_configurations(pd.concat([may, june], ignore_index=True))
+
+
+def test_selection_rejects_candidates_with_different_forecast_origin_sets() -> None:
+    may = pd.DataFrame(
+        {
+            "split": ["may_2026_selection", "may_2026_selection"],
+            "target": ["pv_kw", "pv_kw"],
+            "model_name": ["chronos2_pv_calendar", "chronos2_pv_univariate"],
+            "model_id": ["amazon/chronos-2", "amazon/chronos-2"],
+            "context_length": [672, 1344],
+            "postprocessing": ["physical_clip_0_1700", "physical_clip_0_1700"],
+            "n_origins": [31, 31],
+            "forecast_origin_set": ["may-01|may-02", "may-01|may-03"],
+            "wape": [0.1, 0.2],
+            "pv_active_mae": [8.0, 9.0],
+            "mae": [8.0, 9.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="different forecast-origin sets"):
+        select_may_configurations(may)
