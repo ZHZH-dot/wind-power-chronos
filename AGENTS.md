@@ -2,9 +2,11 @@
 
 ## Project goal
 
-We are building a production-oriented wind power forecasting MVP using Chronos-2 on SDWPF first.
+We are building production-oriented Chronos-2 forecasting benchmarks for the
+existing SDWPF wind dataset and the Foshan/Shunde PV-storage site.
 
-The project is mainly multivariate / covariate-informed wind power forecasting.
+The project is mainly multivariate / covariate-informed forecasting. Preserve
+both the SDWPF wind route and the Foshan PV/grid-exchange route.
 
 The Forecasting Agent supports Chronos-2 zero-shot inference and Chronos-2 LoRA fine-tuning through AutoGluon TimeSeries. Do not add other agents or forecasting model families unless explicitly asked.
 

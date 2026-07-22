@@ -1,4 +1,5 @@
 numpy
 pandas
 pyarrow
+openpyxl
 pytest

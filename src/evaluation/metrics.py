@@ -42,6 +42,62 @@ def bias(y_true: Iterable[float], y_pred: Iterable[float]) -> float:
     return float(np.mean(predicted - actual))
 
 
+def wape(y_true: Iterable[float], y_pred: Iterable[float]) -> float:
+    """Weighted absolute percentage error with an absolute-actual denominator."""
+    actual, predicted = _clean_arrays(y_true, y_pred)
+    if actual.size == 0:
+        return math.nan
+    denominator = float(np.sum(np.abs(actual)))
+    if denominator == 0:
+        return math.nan
+    return float(np.sum(np.abs(actual - predicted)) / denominator)
+
+
+def mase(
+    y_true: Iterable[float],
+    y_pred: Iterable[float],
+    insample: Iterable[float],
+    seasonal_period: int = 1,
+) -> float:
+    """Mean absolute scaled error using a strictly historical seasonal scale."""
+    if seasonal_period <= 0:
+        raise ValueError("seasonal_period must be positive.")
+    history = np.asarray(list(insample), dtype=float)
+    if history.size <= seasonal_period:
+        return math.nan
+    current = history[seasonal_period:]
+    lagged = history[:-seasonal_period]
+    mask = np.isfinite(current) & np.isfinite(lagged)
+    if not np.any(mask):
+        return math.nan
+    scale = float(np.mean(np.abs(current[mask] - lagged[mask])))
+    if not math.isfinite(scale) or scale == 0:
+        return math.nan
+    return mae(y_true, y_pred) / scale
+
+
+def mase_from_scales(
+    y_true: Iterable[float],
+    y_pred: Iterable[float],
+    scales: Iterable[float],
+) -> float:
+    """Aggregate absolute scaled errors when each origin has a causal scale."""
+    actual = np.asarray(list(y_true), dtype=float)
+    predicted = np.asarray(list(y_pred), dtype=float)
+    scale_values = np.asarray(list(scales), dtype=float)
+    if actual.shape != predicted.shape or actual.shape != scale_values.shape:
+        raise ValueError("y_true, y_pred, and scales must have the same shape.")
+    mask = (
+        np.isfinite(actual)
+        & np.isfinite(predicted)
+        & np.isfinite(scale_values)
+        & (scale_values > 0)
+    )
+    if not np.any(mask):
+        return math.nan
+    return float(np.mean(np.abs(actual[mask] - predicted[mask]) / scale_values[mask]))
+
+
 def _default_normalizer(y_true: np.ndarray) -> float:
     return float(np.mean(np.abs(y_true)))
 

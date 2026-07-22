@@ -1,0 +1,73 @@
+{
+  "benchmark_name": "foshan_chronos2_zero_shot",
+  "site_id": "foshan_site",
+  "model_id": "amazon/chronos-2",
+  "frequency": "15min",
+  "timezone": "Asia/Shanghai",
+  "prediction_length": 96,
+  "quantile_levels": [0.1, 0.5, 0.9],
+  "context_lengths": [672, 1344, 2688],
+  "inference_batch_size": 64,
+  "origin_stride_steps": 96,
+  "issue_time": "00:00",
+  "causal_fill_limit": 2,
+  "pv_capacity_kw": 1700.0,
+  "pv_active_threshold_kw": 1.0,
+  "selection_period": {
+    "name": "may_2026_selection",
+    "start": "2026-05-01T00:00:00+08:00",
+    "end_exclusive": "2026-06-01T00:00:00+08:00"
+  },
+  "test_period": {
+    "name": "june_2026_test",
+    "start": "2026-06-01T00:00:00+08:00",
+    "end_exclusive": "2026-07-01T00:00:00+08:00"
+  },
+  "calendar_covariates": [
+    "minute_of_day_sin",
+    "minute_of_day_cos",
+    "day_of_week_sin",
+    "day_of_week_cos",
+    "is_weekend",
+    "month_sin",
+    "month_cos"
+  ],
+  "optional_known_future_weather_covariates": [
+    "ghi",
+    "dni",
+    "dhi",
+    "cloud_cover",
+    "temperature"
+  ],
+  "configurations": [
+    {
+      "name": "chronos2_pv_univariate",
+      "targets": ["pv_kw"],
+      "known_future_covariates": []
+    },
+    {
+      "name": "chronos2_pv_calendar",
+      "targets": ["pv_kw"],
+      "known_future_covariates": ["calendar"]
+    },
+    {
+      "name": "chronos2_net_grid_calendar",
+      "targets": ["net_grid_kw"],
+      "known_future_covariates": ["calendar"],
+      "provisional_target": true
+    },
+    {
+      "name": "chronos2_joint_calendar",
+      "targets": ["pv_kw", "net_grid_kw"],
+      "known_future_covariates": ["calendar"],
+      "provisional_targets": ["net_grid_kw"]
+    }
+  ],
+  "selection": {
+    "primary_target": "pv_kw",
+    "primary_metric": "wape",
+    "tie_break_metric": "pv_active_mae",
+    "postprocessing": "physical_clip_0_1700",
+    "secondary_grid_metric": "wape"
+  }
+}

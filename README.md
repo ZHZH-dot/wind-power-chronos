@@ -209,6 +209,151 @@ Evaluation excludes `is_imputed_target == True` rows unless `--include-imputed-t
 
 Prediction files preserve Chronos-2 `p10`, `p50`, and `p90`; `y_pred` remains an alias for `p50`. Point metrics use `p50`. Probabilistic metrics include pinball loss at each quantile, mean pinball loss, P10-P90 interval coverage, and mean interval width.
 
+## Foshan PV-Storage Zero-Shot Benchmark
+
+This route is a separate, zero-shot-only Chronos-2 benchmark. It does not alter
+the SDWPF split or fine-tuning workflow. The primary workbook supplies two
+signals:
+
+- `光伏` is mapped to `pv_kw`.
+- `负荷` is mapped to `net_grid_kw`, provisionally classified as bidirectional
+  grid exchange. It is not confirmed gross factory load. Negative values are
+  preserved and the field is never clipped or renamed `gross_load_kw`.
+
+The storage workbook is audit-only. Its five-minute total active power is
+aggregated by arithmetic mean into left-closed 15-minute intervals. The
+diagnostic `gross_load_proxy_kw = net_grid_kw + pv_kw + pcs_kw` is not a
+forecast target.
+
+Install the isolated zero-shot environment dependencies. The exact Chronos
+release is pinned so this route does not force a dependency change in the
+AutoGluon fine-tuning environment:
+
+```bash
+python -m pip install -r requirements-foshan-zero-shot.txt
+```
+
+### Foshan Data Audit And Baselines
+
+Pass the workbook paths explicitly; the code never writes under `data/raw/`.
+
+```bash
+python -m src.data.prepare_foshan \
+  --source-workbook 'data/raw/光伏与负荷数据_202603-06.xlsx' \
+  --storage-workbook 'data/raw/储能数据20260707230737.xlsx' \
+  --output results/zero_shot/foshan_chronos2/processed_foshan_15min.parquet \
+  --audit-dir results/zero_shot/foshan_chronos2
+
+python -m src.models.foshan_chronos_zero_shot \
+  --config configs/foshan_chronos2_zero_shot.json \
+  --processed-input results/zero_shot/foshan_chronos2/processed_foshan_15min.parquet \
+  --output-dir results/zero_shot/foshan_chronos2 \
+  --stage baselines
+```
+
+Preparation sorts the reverse-chronological source, localizes timestamps to
+`Asia/Shanghai`, and creates an exact 15-minute grid without globally filling
+targets. `pv_kw_raw` is retained while the physical target is clipped to
+`[0, 1700]` kW. Every negative PV reading is written to
+`pv_negative_readings.csv`. Signed `net_grid_kw` is unchanged.
+
+At each origin, context ends at 23:45 and contains timestamps strictly before
+the 00:00 issue time. Missing context values may only be forward-filled for two
+15-minute intervals; no backward-fill or interpolation can cross an issue
+boundary. Origins with unresolved context gaps are skipped and reported.
+
+The causal baselines use the same May and June origins: PV zero, last-value
+persistence, previous-day slot, previous-week slot, and the mean of the same
+slot over the preceding four weeks. Deterministic baselines leave P10/P90
+missing rather than inventing uncertainty.
+
+### Foshan Selection And Test Protocol
+
+`configs/foshan_chronos2_zero_shot.json` fixes the benchmark contract:
+
+- 15-minute frequency and all 96 next-day steps;
+- P10/P50/P90 and context candidates 672, 1344, and 2688 points;
+- May 2026 for configuration/context selection only;
+- June 2026 as the untouched final test;
+- calendar covariates only as known-future inputs;
+- univariate PV, calendar-informed PV, provisional calendar-informed grid, and
+  official multi-target joint PV/grid configurations.
+
+The joint configuration passes `target=["pv_kw", "net_grid_kw"]` and maps
+Chronos output through `target_name`. Future dataframes contain only numeric
+calendar columns. Optional real weather forecasts can later be supplied with
+`--weather-covariates ghi,dni,dhi,cloud_cover,temperature` after those columns
+are added to the processed table; no weather is fabricated or downloaded.
+
+May selection uses postprocessed PV WAPE, then PV-active MAE (`y_true > 1 kW`),
+then model name and context length as deterministic tie-breaks. June never
+participates in selection. Grid selection is secondary and remains provisional.
+
+Metrics include MAE, RMSE, WAPE, causal seasonal MASE, bias, P10/P50/P90
+pinball loss, mean pinball loss, P10-P90 coverage, interval width, and PV-active
+MAE/RMSE/WAPE. They are saved both in aggregate and for every horizon step
+1-96. Missing target rows are not scored. MAPE is intentionally omitted because
+PV is zero at night and grid exchange crosses zero.
+
+### Foshan One-Origin Smoke
+
+On one CUDA GPU, run the safety smoke against an already prepared table:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.models.foshan_chronos_zero_shot \
+  --config configs/foshan_chronos2_zero_shot.json \
+  --processed-input results/zero_shot/foshan_chronos2/processed_foshan_15min.parquet \
+  --output-dir results/zero_shot/foshan_chronos2 \
+  --model-id amazon/chronos-2 \
+  --device-map cuda \
+  --stage smoke
+```
+
+For a restricted server, set `CHRONOS_MODEL_PATH` or pass `--model-path` to a
+complete local `amazon/chronos-2` directory. Loading still uses
+`Chronos2Pipeline.from_pretrained(...)`; the repository contains no copied
+Chronos source or direct Hugging Face download URLs.
+
+### Foshan Full AutoDL Run
+
+The launcher creates a separate conda environment, pins
+`chronos-forecasting==2.3.1`, exposes only GPU 0, prints the CUDA/BF16 preflight,
+runs tests, prepares and audits the workbooks, completes all baselines, runs a
+one-origin Chronos smoke, selects on May, and evaluates the frozen choice on
+June. One loaded pipeline is reused for the smoke, selection configurations,
+and final test.
+
+```bash
+HF_HOME=/data/GDUT_stu/.cache/huggingface \
+CHRONOS_MODEL_PATH=/data/GDUT_stu/models/chronos-2 \
+bash scripts/run_foshan_zero_shot_autodl.sh \
+  '/path/to/光伏与负荷数据_202603-06.xlsx' \
+  '/path/to/储能数据20260707230737.xlsx'
+```
+
+Without a local model path, omit `CHRONOS_MODEL_PATH` and the launcher uses
+`amazon/chronos-2`. The required outputs are written under
+`results/zero_shot/foshan_chronos2/`, including audits, the processed parquet,
+long-form predictions, May/June metrics, per-horizon metrics, metadata,
+environment freeze, report, and representative high-output, variable-output,
+and median-output PV-day plots. Plot labels make no unsupported clear/cloudy
+claim.
+
+The equivalent single-process command below computes baselines first, runs the
+one-origin smoke, then reuses that pipeline for May selection and frozen June
+evaluation:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.models.foshan_chronos_zero_shot \
+  --config configs/foshan_chronos2_zero_shot.json \
+  --source-workbook '/path/to/光伏与负荷数据_202603-06.xlsx' \
+  --storage-workbook '/path/to/储能数据20260707230737.xlsx' \
+  --output-dir results/zero_shot/foshan_chronos2 \
+  --model-id amazon/chronos-2 \
+  --device-map cuda \
+  --stage all
+```
+
 ## Chronos-2 LoRA Fine-Tuning
 
 Fine-tuning reuses the same global chronological benchmark. `configs/splits/sdwpf_70_10_20.json` defines the 70% train, 10% validation, and 20% test ratios plus the 72-hour prediction length, 168-hour context, benchmark horizons, hourly frequency, and seed 42.
