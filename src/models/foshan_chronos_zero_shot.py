@@ -69,6 +69,18 @@ def resolve_known_future_covariates(
     return list(dict.fromkeys(columns))
 
 
+def chronos_input_frame(frame: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Copy a frame and remove timezone metadata without shifting local clock time."""
+    if frame is None:
+        return None
+    result = frame.copy()
+    timestamps = pd.to_datetime(result["timestamp"])
+    if timestamps.dt.tz is not None:
+        timestamps = timestamps.dt.tz_localize(None)
+    result["timestamp"] = timestamps.astype("datetime64[ns]")
+    return result
+
+
 def run_chronos_configuration(
     pipeline: Any,
     table: pd.DataFrame,
@@ -121,9 +133,11 @@ def run_chronos_configuration(
                 )
                 continue
             target_argument: str | list[str] = targets[0] if len(targets) == 1 else targets
+            context_df = chronos_input_frame(window.context_df)
+            future_df = chronos_input_frame(window.future_df)
             forecast_df = pipeline.predict_df(
-                window.context_df,
-                future_df=window.future_df,
+                context_df,
+                future_df=future_df,
                 prediction_length=int(config["prediction_length"]),
                 quantile_levels=[float(value) for value in config["quantile_levels"]],
                 id_column="id",

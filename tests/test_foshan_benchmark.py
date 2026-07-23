@@ -22,7 +22,10 @@ from src.evaluation.foshan_benchmark import (
     select_may_configurations,
 )
 from src.evaluation.metrics import mase, wape
-from src.models.foshan_chronos_zero_shot import run_chronos_configuration
+from src.models.foshan_chronos_zero_shot import (
+    chronos_input_frame,
+    run_chronos_configuration,
+)
 
 
 def _write_source_workbook(path: Path) -> None:
@@ -207,6 +210,119 @@ def test_multi_target_target_name_mapping_is_not_positional() -> None:
     assert normalized.loc[normalized["target"] == "net_grid_kw", "p50"].tolist() == [20.0, 21.0]
 
 
+def test_chronos_input_frame_preserves_local_clock_without_mutating_window() -> None:
+    table = _site_table(periods=120)
+    issue = table.loc[16, "timestamp"]
+    window, reason = build_forecast_window(
+        table,
+        issue,
+        targets=["pv_kw", "net_grid_kw"],
+        context_length=8,
+        prediction_length=4,
+        known_future_covariates=CALENDAR_COLUMNS,
+    )
+
+    assert reason is None
+    assert window is not None
+    assert window.future_df is not None
+    original_context = window.context_df.copy()
+    original_future = window.future_df.copy()
+
+    context_df = chronos_input_frame(window.context_df)
+    future_df = chronos_input_frame(window.future_df)
+
+    assert context_df is not None
+    assert future_df is not None
+    assert str(context_df["timestamp"].dtype) == "datetime64[ns]"
+    assert str(future_df["timestamp"].dtype) == "datetime64[ns]"
+    assert context_df["timestamp"].to_numpy().view("int64").dtype == np.int64
+    assert future_df["timestamp"].to_numpy().view("int64").dtype == np.int64
+    assert context_df["timestamp"].tolist() == [
+        timestamp.tz_localize(None) for timestamp in original_context["timestamp"]
+    ]
+    assert future_df["timestamp"].tolist() == [
+        timestamp.tz_localize(None) for timestamp in original_future["timestamp"]
+    ]
+    pd.testing.assert_frame_equal(window.context_df, original_context)
+    pd.testing.assert_frame_equal(window.future_df, original_future)
+    assert str(window.context_df["timestamp"].dt.tz) == "Asia/Shanghai"
+    assert str(window.future_df["timestamp"].dt.tz) == "Asia/Shanghai"
+
+
+def test_univariate_fake_pipeline_receives_timezone_naive_context() -> None:
+    class FakePipeline:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def predict_df(
+            self,
+            context_df: pd.DataFrame,
+            future_df: pd.DataFrame | None,
+            **kwargs: object,
+        ) -> pd.DataFrame:
+            self.calls.append(
+                {"context": context_df.copy(), "future": future_df, **kwargs}
+            )
+            start = context_df["timestamp"].max() + pd.Timedelta(minutes=15)
+            timestamps = pd.date_range(
+                start, periods=int(kwargs["prediction_length"]), freq="15min"
+            )
+            return pd.DataFrame(
+                {
+                    "id": "foshan_site",
+                    "timestamp": timestamps,
+                    "0.1": 1.0,
+                    "0.5": 2.0,
+                    "0.9": 3.0,
+                }
+            )
+
+    table = _site_table(periods=120)
+    issue = table.loc[16, "timestamp"]
+    config = {
+        "prediction_length": 4,
+        "quantile_levels": [0.1, 0.5, 0.9],
+        "inference_batch_size": 8,
+        "causal_fill_limit": 3,
+        "frequency": "15min",
+        "pv_capacity_kw": 1700.0,
+        "site_id": "foshan_site",
+        "calendar_covariates": CALENDAR_COLUMNS,
+    }
+    pipeline = FakePipeline()
+
+    predictions, skipped, _ = run_chronos_configuration(
+        pipeline,
+        table,
+        config,
+        {
+            "name": "chronos2_pv_univariate",
+            "targets": ["pv_kw"],
+            "known_future_covariates": [],
+        },
+        context_lengths=[8],
+        origins=[issue],
+        split_name="may_2026_selection",
+        run_id="test",
+        model_source="amazon/chronos-2",
+    )
+
+    assert not skipped
+    assert len(pipeline.calls) == 1
+    call = pipeline.calls[0]
+    context_df = call["context"]
+    assert isinstance(context_df, pd.DataFrame)
+    assert str(context_df["timestamp"].dtype) == "datetime64[ns]"
+    assert context_df["timestamp"].dt.tz is None
+    assert context_df["timestamp"].iloc[-1] == (issue - pd.Timedelta(minutes=15)).tz_localize(
+        None
+    )
+    assert call["future"] is None
+    assert call["target"] == "pv_kw"
+    assert str(predictions["target_time"].dt.tz) == "Asia/Shanghai"
+    assert str(table["timestamp"].dt.tz) == "Asia/Shanghai"
+
+
 def test_fake_pipeline_receives_target_free_future_dataframe() -> None:
     class FakePipeline:
         def __init__(self) -> None:
@@ -236,7 +352,7 @@ def test_fake_pipeline_receives_target_free_future_dataframe() -> None:
         "prediction_length": 4,
         "quantile_levels": [0.1, 0.5, 0.9],
         "inference_batch_size": 8,
-        "causal_fill_limit": 2,
+        "causal_fill_limit": 3,
         "frequency": "15min",
         "pv_capacity_kw": 1700.0,
         "site_id": "foshan_site",
@@ -265,10 +381,23 @@ def test_fake_pipeline_receives_target_free_future_dataframe() -> None:
     assert len(pipeline.calls) == 1
     call = pipeline.calls[0]
     assert call["target"] == ["pv_kw", "net_grid_kw"]
-    assert pd.Timestamp(call["context"]["timestamp"].max()) < issue
-    assert not {"pv_kw", "net_grid_kw"}.intersection(call["future"].columns)
+    context_df = call["context"]
+    future_df = call["future"]
+    assert isinstance(context_df, pd.DataFrame)
+    assert isinstance(future_df, pd.DataFrame)
+    assert str(context_df["timestamp"].dtype) == "datetime64[ns]"
+    assert str(future_df["timestamp"].dtype) == "datetime64[ns]"
+    assert context_df["timestamp"].dt.tz is None
+    assert future_df["timestamp"].dt.tz is None
+    assert context_df["timestamp"].iloc[-1] == (issue - pd.Timedelta(minutes=15)).tz_localize(
+        None
+    )
+    assert future_df["timestamp"].iloc[0] == issue.tz_localize(None)
+    assert not {"pv_kw", "net_grid_kw"}.intersection(future_df.columns)
     grid = predictions[predictions["target"] == "net_grid_kw"]
     assert grid["p50"].eq(12.0).all()
+    assert str(predictions["target_time"].dt.tz) == "Asia/Shanghai"
+    assert str(table["timestamp"].dt.tz) == "Asia/Shanghai"
 
 
 def test_pv_postprocessing_clips_and_repairs_quantile_order() -> None:
