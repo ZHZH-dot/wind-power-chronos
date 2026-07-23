@@ -1,0 +1,81 @@
+{
+  "benchmark_name": "foshan_chronos2_lora",
+  "model_id": "amazon/chronos-2",
+  "site_id": "foshan_site",
+  "frequency": "15min",
+  "timezone": "Asia/Shanghai",
+  "prediction_length": 96,
+  "context_length": 672,
+  "quantile_levels": [0.1, 0.5, 0.9],
+  "inference_batch_size": 64,
+  "causal_fill_limit": 3,
+  "pv_capacity_kw": 1700.0,
+  "pv_active_threshold_kw": 1.0,
+  "train_period": {
+    "name": "march_april_2026_train",
+    "start": "2026-03-01T00:00:00+08:00",
+    "end_exclusive": "2026-05-01T00:00:00+08:00"
+  },
+  "selection_period": {
+    "name": "may_2026_selection",
+    "start": "2026-05-01T00:00:00+08:00",
+    "end_exclusive": "2026-06-01T00:00:00+08:00"
+  },
+  "test_period": {
+    "name": "june_2026_test",
+    "start": "2026-06-01T00:00:00+08:00",
+    "end_exclusive": "2026-07-01T00:00:00+08:00"
+  },
+  "calendar_covariates": [
+    "minute_of_day_sin",
+    "minute_of_day_cos",
+    "day_of_week_sin",
+    "day_of_week_cos",
+    "is_weekend",
+    "month_sin",
+    "month_cos"
+  ],
+  "variants": [
+    {
+      "name": "pv_calendar",
+      "targets": ["pv_kw"],
+      "selection_target": "pv_kw"
+    },
+    {
+      "name": "joint_calendar",
+      "targets": ["pv_kw", "net_grid_kw"],
+      "selection_target": "pv_kw",
+      "auxiliary_targets": ["net_grid_kw"],
+      "provisional_targets": ["net_grid_kw"]
+    }
+  ],
+  "smoke_candidate": {
+    "name": "smoke_r8_lr1e5_1s_b1_seed42",
+    "rank": 8,
+    "lora_alpha": 16,
+    "learning_rate": 1e-5,
+    "steps": 1,
+    "batch_size": 1,
+    "seed": 42
+  },
+  "search_candidates": [
+    {
+      "name": "r8_lr1e5_100s_b8_seed42",
+      "rank": 8,
+      "lora_alpha": 16,
+      "learning_rate": 1e-5,
+      "steps": 100,
+      "batch_size": 8,
+      "seed": 42
+    },
+    {
+      "name": "r16_lr5e5_100s_b8_seed42",
+      "rank": 16,
+      "lora_alpha": 32,
+      "learning_rate": 5e-5,
+      "steps": 100,
+      "batch_size": 8,
+      "seed": 42
+    }
+  ]
+}

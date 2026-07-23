@@ -15,6 +15,7 @@ from src.evaluation.foshan_benchmark import (
     ForecastWindow,
     build_forecast_window,
     chronos_rows_for_window,
+    evaluate_common_scored_timestamps,
     normalize_chronos_quantiles,
     period_origins,
     postprocess_pv_quantiles,
@@ -529,3 +530,31 @@ def test_selection_rejects_candidates_with_different_forecast_origin_sets() -> N
 
     with pytest.raises(ValueError, match="different forecast-origin sets"):
         select_may_configurations(may)
+
+
+def test_common_scored_comparison_uses_exact_forecast_key_intersection() -> None:
+    table = _site_table(periods=96 * 36)
+    origins = [table.loc[96 * 34, "timestamp"], table.loc[96 * 35, "timestamp"]]
+    predictions = run_causal_baselines(
+        table,
+        origins,
+        split_name="june_2026_test",
+        run_id="test",
+    )
+    predictions = predictions[
+        (predictions["target"] == "pv_kw")
+        & predictions["model_name"].isin(["previous_day", "previous_week"])
+    ].copy()
+    excluded_key = predictions[predictions["model_name"] == "previous_day"].index[0]
+    predictions.loc[excluded_key, "is_missing_target"] = True
+
+    common, metrics = evaluate_common_scored_timestamps(predictions)
+
+    assert len(metrics) == 2
+    assert metrics["n_common_scored"].nunique() == 1
+    assert metrics["n_common_scored"].iloc[0] == 191
+    assert metrics["n_scored"].eq(191).all()
+    assert set(common.groupby("model_name").size()) == {191}
+    assert metrics["common_target_time_set"].nunique() == 1
+    previous_week = metrics[metrics["model_name"] == "previous_week"].iloc[0]
+    assert previous_week["n_excluded_noncommon"] == 1

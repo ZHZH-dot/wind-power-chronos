@@ -7,7 +7,6 @@ import importlib.metadata
 import json
 import math
 import os
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -29,6 +28,7 @@ from src.evaluation.foshan_benchmark import (
     build_forecast_window,
     chronos_rows_for_window,
     configurations_for_frozen_test,
+    evaluate_common_scored_timestamps,
     evaluate_foshan_predictions,
     load_foshan_config,
     period_origins,
@@ -36,6 +36,7 @@ from src.evaluation.foshan_benchmark import (
     select_may_configurations,
     validate_processed_table,
 )
+from src.utils.runtime import git_commit, git_is_dirty
 
 
 DEFAULT_CONFIG = Path("configs/foshan_chronos2_zero_shot.json")
@@ -175,20 +176,6 @@ def _package_version(package: str) -> str | None:
         return None
 
 
-def _git_output(*args: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return None
-    return result.stdout.strip()
-
-
 def collect_environment_metadata(model_source: str) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "python_version": sys.version,
@@ -205,8 +192,8 @@ def collect_environment_metadata(model_source: str) -> dict[str, Any]:
             )
         },
         "model_id_or_path": model_source,
-        "git_commit": _git_output("rev-parse", "HEAD"),
-        "git_dirty": bool(_git_output("status", "--porcelain")),
+        "git_commit": git_commit(),
+        "git_dirty": git_is_dirty(),
         "cuda_available": False,
         "gpu_name": None,
         "gpu_total_vram_bytes": None,
@@ -324,11 +311,32 @@ def save_prediction_outputs(
     test_metrics.to_csv(output_dir / "test_metrics_june.csv", index=False)
     metrics_by_model.to_csv(output_dir / "metrics_by_model.csv", index=False)
     metrics_by_horizon.to_csv(output_dir / "metrics_by_horizon.csv", index=False)
+    common_predictions = pd.DataFrame(columns=PREDICTION_COLUMNS)
+    common_metrics = pd.DataFrame()
+    june_pv = predictions[
+        (predictions["split"] == "june_2026_test")
+        & (predictions["target"] == "pv_kw")
+    ]
+    if not june_pv.empty and june_pv["model_id"].ne("causal_baseline").any():
+        common_predictions, common_metrics = evaluate_common_scored_timestamps(
+            june_pv,
+            target="pv_kw",
+            split="june_2026_test",
+            pv_active_threshold_kw=pv_active_threshold_kw,
+        )
+        common_predictions.to_csv(
+            output_dir / "common_scored_predictions_june.csv", index=False
+        )
+        common_metrics.to_csv(
+            output_dir / "common_scored_metrics_june.csv", index=False
+        )
     return {
         "metrics_by_model": metrics_by_model,
         "metrics_by_horizon": metrics_by_horizon,
         "selection_metrics": selection_metrics,
         "test_metrics": test_metrics,
+        "common_scored_predictions": common_predictions,
+        "common_scored_metrics": common_metrics,
     }
 
 

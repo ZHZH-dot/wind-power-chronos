@@ -258,7 +258,7 @@ targets. `pv_kw_raw` is retained while the physical target is clipped to
 `pv_negative_readings.csv`. Signed `net_grid_kw` is unchanged.
 
 At each origin, context ends at 23:45 and contains timestamps strictly before
-the 00:00 issue time. Missing context values may only be forward-filled for two
+the 00:00 issue time. Missing context values may only be forward-filled for three
 15-minute intervals; no backward-fill or interpolation can cross an issue
 boundary. Origins with unresolved context gaps are skipped and reported.
 
@@ -294,6 +294,12 @@ pinball loss, mean pinball loss, P10-P90 coverage, interval width, and PV-active
 MAE/RMSE/WAPE. They are saved both in aggregate and for every horizon step
 1-96. Missing target rows are not scored. MAPE is intentionally omitted because
 PV is zero at night and grid exchange crosses zero.
+
+After the frozen June model is available, the benchmark also writes
+`common_scored_predictions_june.csv` and `common_scored_metrics_june.csv`.
+These tables intersect exact `(issue_time, target_time, horizon_step)` keys
+before comparing Chronos with causal baselines; models are never compared on
+different scored timestamps. The original metric files remain unchanged.
 
 ### Foshan One-Origin Smoke
 
@@ -353,6 +359,44 @@ CUDA_VISIBLE_DEVICES=0 python -m src.models.foshan_chronos_zero_shot \
   --device-map cuda \
   --stage all
 ```
+
+### Foshan Chronos-2 LoRA Experiment
+
+The Foshan fine-tuning route writes to `results/fine_tune/` and treats the
+completed zero-shot directory as read-only. The fixed protocol uses:
+
+- March-April 2026 for LoRA training;
+- May 2026 only for candidate selection;
+- June 2026 for one frozen selected-model evaluation;
+- 672 context points, 96 forecast points, and P10/P50/P90;
+- calendar values as known-future covariates;
+- signed `net_grid_kw` only as a provisional auxiliary series in the joint
+  challenger, never as a production gross-load target.
+
+`configs/foshan_chronos2_lora.json` logs the rank, LoRA alpha, learning rate,
+step count, batch size, and seed for every candidate. Selection minimizes
+postprocessed May PV WAPE and uses PV-active MAE as the tie-breaker. June is
+never used for training, checkpoint selection, or hyperparameter selection.
+
+On the RTX 4090 machine with AutoGluon 1.5 and Chronos-2 already installed:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export HF_HOME=/data/GDUT_stu/.cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export CHRONOS_MODEL_PATH=/data/GDUT_stu/models/chronos-2
+
+bash scripts/run_foshan_finetune_4090.sh \
+  results/zero_shot/foshan_chronos2/processed_foshan_15min.parquet
+```
+
+The launcher runs CPU tests and a model-free dry run first. It then performs
+one LoRA gradient step with batch size one and one May forecast origin. The
+March-April search starts only if that smoke succeeds. Search outputs include
+all candidate logs, May metrics, the frozen selection, one June prediction
+table, common-scored comparisons with frozen zero-shot and causal baselines,
+runtime, peak VRAM, adapter paths, and explicit failure records.
 
 ## Chronos-2 LoRA Fine-Tuning
 

@@ -612,6 +612,112 @@ def evaluate_foshan_predictions(
     return pd.DataFrame(rows)
 
 
+def evaluate_common_scored_timestamps(
+    predictions: pd.DataFrame,
+    target: str = "pv_kw",
+    split: str = "june_2026_test",
+    pv_active_threshold_kw: float = 1.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Score model variants on the exact intersection of valid forecast timestamps."""
+    missing_columns = sorted(set(PREDICTION_COLUMNS) - set(predictions.columns))
+    if missing_columns:
+        raise ValueError(
+            f"Common-timestamp comparison is missing columns: {missing_columns}"
+        )
+
+    selected = predictions[
+        (predictions["target"] == target) & (predictions["split"] == split)
+    ].copy()
+    if selected.empty:
+        raise ValueError(f"No predictions found for target={target!r}, split={split!r}.")
+
+    identity_columns = [
+        "model_name",
+        "model_id",
+        "context_length",
+        "postprocessing",
+        "provisional_target",
+    ]
+    key_columns = ["issue_time", "target_time", "horizon_step"]
+    selected["issue_time"] = pd.to_datetime(selected["issue_time"], errors="raise", utc=True)
+    selected["target_time"] = pd.to_datetime(
+        selected["target_time"], errors="raise", utc=True
+    )
+    selected["_missing"] = _bool_series(selected["is_missing_target"])
+    selected["_valid"] = (
+        ~selected["_missing"]
+        & np.isfinite(pd.to_numeric(selected["y_true"], errors="coerce"))
+        & np.isfinite(pd.to_numeric(selected["p50"], errors="coerce"))
+    )
+
+    valid_key_sets: list[set[tuple[Any, ...]]] = []
+    valid_counts: dict[tuple[Any, ...], int] = {}
+    for identity, group in selected.groupby(identity_columns, sort=True, dropna=False):
+        identity_tuple = identity if isinstance(identity, tuple) else (identity,)
+        if group.duplicated(key_columns).any():
+            raise ValueError(
+                "A model variant has duplicate forecast keys in common-timestamp "
+                f"comparison: {identity_tuple}"
+            )
+        valid = group[group["_valid"]]
+        keys = set(valid[key_columns].itertuples(index=False, name=None))
+        valid_key_sets.append(keys)
+        valid_counts[identity_tuple] = len(keys)
+    if len(valid_key_sets) < 2:
+        raise ValueError("Common-timestamp comparison requires at least two model variants.")
+
+    common_keys = set.intersection(*valid_key_sets)
+    if not common_keys:
+        raise ValueError("Model variants have no common scored forecast timestamps.")
+
+    key_index = pd.MultiIndex.from_tuples(common_keys, names=key_columns)
+    selected_index = pd.MultiIndex.from_frame(selected[key_columns])
+    common = selected.loc[selected_index.isin(key_index)].copy()
+    common = common.drop(columns=["_missing", "_valid"])
+
+    truth_values = pd.to_numeric(common["y_true"], errors="raise")
+    truth_summary = (
+        common.assign(_truth=truth_values)
+        .groupby(key_columns, sort=False)["_truth"]
+        .agg(["min", "max"])
+    )
+    truth_spread = truth_summary["max"] - truth_summary["min"]
+    truth_scale = truth_summary[["min", "max"]].abs().max(axis=1)
+    truth_tolerance = 1e-9 + 1e-12 * truth_scale
+    if (truth_spread > truth_tolerance).any():
+        raise ValueError(
+            "Ground truth differs across model variants on common timestamps; "
+            f"maximum difference={truth_spread.max():.12g}."
+        )
+
+    metrics = evaluate_foshan_predictions(
+        common,
+        pv_active_threshold_kw=pv_active_threshold_kw,
+    )
+    common_target_times = sorted(
+        {timestamp.isoformat() for timestamp in common["target_time"]}
+    )
+    metrics["comparison_scope"] = "exact_common_scored_timestamps"
+    metrics["n_common_scored"] = len(common_keys)
+    metrics["common_target_time_set"] = "|".join(common_target_times)
+    metrics["n_valid_before_intersection"] = metrics.apply(
+        lambda row: valid_counts[
+            (
+                row["model_name"],
+                row["model_id"],
+                row["context_length"],
+                row["postprocessing"],
+                row["provisional_target"],
+            )
+        ],
+        axis=1,
+    )
+    metrics["n_excluded_noncommon"] = (
+        metrics["n_valid_before_intersection"] - metrics["n_common_scored"]
+    )
+    return common[PREDICTION_COLUMNS].reset_index(drop=True), metrics
+
+
 def select_may_configurations(metrics: pd.DataFrame) -> dict[str, Any]:
     """Select Chronos configuration/context pairs without consulting June."""
     if metrics.empty:

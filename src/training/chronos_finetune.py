@@ -248,6 +248,10 @@ def build_chronos2_hyperparameters(
     dataloader_num_workers: int = 0,
     bf16: bool = False,
     fp16: bool = False,
+    lora_rank: int | None = None,
+    lora_alpha: int | None = None,
+    disable_known_covariates: bool = True,
+    disable_past_covariates: bool | None = None,
 ) -> dict[str, dict[str, Any]]:
     if min(prediction_length, context_length, steps, batch_size, inference_batch_size) <= 0:
         raise ValueError("Lengths, steps, and batch sizes must be positive.")
@@ -257,33 +261,47 @@ def build_chronos2_hyperparameters(
         raise ValueError("--dataloader-num-workers must be non-negative.")
     if bf16 and fp16:
         raise ValueError("BF16 and FP16 cannot both be enabled.")
+    if lora_rank is not None and lora_rank <= 0:
+        raise ValueError("LoRA rank must be positive.")
+    if lora_alpha is not None and lora_alpha <= 0:
+        raise ValueError("LoRA alpha must be positive.")
+    if lora_alpha is not None and lora_rank is None:
+        raise ValueError("LoRA alpha requires an explicit LoRA rank.")
 
-    return {
-        "Chronos2": {
-            "model_path": model_id,
-            "device": "cuda",
-            "batch_size": inference_batch_size,
-            "context_length": context_length,
-            "fine_tune": True,
-            "fine_tune_mode": "lora",
-            "fine_tune_lr": learning_rate,
-            "fine_tune_steps": steps,
-            "fine_tune_batch_size": batch_size,
-            "fine_tune_context_length": context_length,
-            "eval_during_fine_tune": True,
-            "disable_known_covariates": True,
-            "disable_past_covariates": mode == "univariate",
-            "fine_tune_trainer_kwargs": {
-                "seed": seed,
-                "data_seed": seed,
-                "dataloader_num_workers": dataloader_num_workers,
-                "bf16": bf16,
-                "fp16": fp16,
-                "disable_data_parallel": True,
-            },
-            "ag_args": {"name_suffix": "LoRA"},
-        }
+    chronos = {
+        "model_path": model_id,
+        "device": "cuda",
+        "batch_size": inference_batch_size,
+        "context_length": context_length,
+        "fine_tune": True,
+        "fine_tune_mode": "lora",
+        "fine_tune_lr": learning_rate,
+        "fine_tune_steps": steps,
+        "fine_tune_batch_size": batch_size,
+        "fine_tune_context_length": context_length,
+        "eval_during_fine_tune": True,
+        "disable_known_covariates": disable_known_covariates,
+        "disable_past_covariates": (
+            mode == "univariate"
+            if disable_past_covariates is None
+            else disable_past_covariates
+        ),
+        "fine_tune_trainer_kwargs": {
+            "seed": seed,
+            "data_seed": seed,
+            "dataloader_num_workers": dataloader_num_workers,
+            "bf16": bf16,
+            "fp16": fp16,
+            "disable_data_parallel": True,
+        },
+        "ag_args": {"name_suffix": "LoRA"},
     }
+    if lora_rank is not None:
+        chronos["fine_tune_lora_config"] = {
+            "r": lora_rank,
+            "lora_alpha": lora_alpha if lora_alpha is not None else 2 * lora_rank,
+        }
+    return {"Chronos2": chronos}
 
 
 def _load_autogluon() -> tuple[Any, Any]:
