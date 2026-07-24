@@ -252,6 +252,8 @@ def build_chronos2_hyperparameters(
     lora_alpha: int | None = None,
     disable_known_covariates: bool = True,
     disable_past_covariates: bool | None = None,
+    fine_tune_mode: str = "lora",
+    model_name_suffix: str = "LoRA",
 ) -> dict[str, dict[str, Any]]:
     if min(prediction_length, context_length, steps, batch_size, inference_batch_size) <= 0:
         raise ValueError("Lengths, steps, and batch sizes must be positive.")
@@ -267,6 +269,12 @@ def build_chronos2_hyperparameters(
         raise ValueError("LoRA alpha must be positive.")
     if lora_alpha is not None and lora_rank is None:
         raise ValueError("LoRA alpha requires an explicit LoRA rank.")
+    if fine_tune_mode not in {"lora", "full"}:
+        raise ValueError("fine_tune_mode must be 'lora' or 'full'.")
+    if fine_tune_mode == "full" and (lora_rank is not None or lora_alpha is not None):
+        raise ValueError("Full fine-tuning cannot use a LoRA configuration.")
+    if not model_name_suffix:
+        raise ValueError("model_name_suffix must not be empty.")
 
     chronos = {
         "model_path": model_id,
@@ -274,7 +282,7 @@ def build_chronos2_hyperparameters(
         "batch_size": inference_batch_size,
         "context_length": context_length,
         "fine_tune": True,
-        "fine_tune_mode": "lora",
+        "fine_tune_mode": fine_tune_mode,
         "fine_tune_lr": learning_rate,
         "fine_tune_steps": steps,
         "fine_tune_batch_size": batch_size,
@@ -294,7 +302,7 @@ def build_chronos2_hyperparameters(
             "fp16": fp16,
             "disable_data_parallel": True,
         },
-        "ag_args": {"name_suffix": "LoRA"},
+        "ag_args": {"name_suffix": model_name_suffix},
     }
     if lora_rank is not None:
         chronos["fine_tune_lora_config"] = {

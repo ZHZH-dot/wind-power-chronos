@@ -27,6 +27,10 @@ Required for fine-tuning:
 - base model: `amazon/chronos-2` or a user-provided local Chronos-2 directory
 - fine-tuning mode: LoRA
 
+Full fine-tuning is permitted only when explicitly requested as an isolated
+Chronos-2 forecasting challenger. It must not replace or overwrite the LoRA
+workflow, and it must use the same leakage-safe benchmark boundaries.
+
 Do not use:
 - original Chronos T5 models
 - Chronos-Bolt models
@@ -136,9 +140,12 @@ The first experiment should:
 - Never pass test targets to AutoGluon `fit`, tuning, checkpoint selection, or refit.
 - Preserve hourly rows and mask `is_imputed_target` rows as missing supervision.
 - Treat measured SDWPF covariates as past-only covariates.
-- Use only the AutoGluon `Chronos2` model with `fine_tune_mode="lora"` and ensembles disabled.
+- Use only the AutoGluon `Chronos2` model and keep ensembles disabled.
+- Default to `fine_tune_mode="lora"`. Use `fine_tune_mode="full"` only for an
+  explicitly requested, isolated challenger that preserves the LoRA outputs.
 - Dry runs and unit tests must not import AutoGluon, load Chronos-2, or require a GPU.
-- Save fine-tuning outputs under `results/fine_tune/` and never overwrite an existing predictor.
+- Save LoRA outputs under `results/fine_tune/` and full-tuning challengers
+  under `results/full_fine_tune/`; never overwrite an existing predictor.
 
 ## Acceptance criteria
 

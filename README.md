@@ -274,7 +274,9 @@ missing rather than inventing uncertainty.
 - 15-minute frequency and all 96 next-day steps;
 - P10/P50/P90 and context candidates 672, 1344, and 2688 points;
 - May 2026 for configuration/context selection only;
-- June 2026 as the untouched final test;
+- June 2026 as the held-out final evaluation in the original benchmark; after
+  the completed zero-shot and LoRA studies it is treated as an engineering
+  test, not a pristine untouched test;
 - calendar covariates only as known-future inputs;
 - univariate PV, calendar-informed PV, provisional calendar-informed grid, and
   official multi-target joint PV/grid configurations.
@@ -397,6 +399,67 @@ March-April search starts only if that smoke succeeds. Search outputs include
 all candidate logs, May metrics, the frozen selection, one June prediction
 table, common-scored comparisons with frozen zero-shot and causal baselines,
 runtime, peak VRAM, adapter paths, and explicit failure records.
+
+### Foshan Chronos-2 Full-Fine-Tuning Challenger
+
+Full fine-tuning is an isolated PV-only forecasting challenger. It does not
+replace the zero-shot or LoRA workflows, does not use `net_grid_kw` as a
+training target, and does not perform DP or revenue optimization. No
+forecast-driven revenue result should be inferred from this experiment.
+
+The fixed protocol in `configs/foshan_chronos2_full_finetune.json` uses:
+
+- `amazon/chronos-2` with `fine_tune_mode="full"` and BF16;
+- March-April 2026 targets for training;
+- cumulative history through May for validation context, with Chronos
+  checkpoint validation on the trailing May window;
+- all 31 May forecast origins for candidate selection;
+- one frozen June engineering evaluation after selection;
+- PV WAPE for selection and PV-active MAE as the deterministic tie-breaker;
+- learning rates `1e-6` and `3e-6`, each at 50 and 100 steps;
+- batch size 4, with OOM-only retries at batch sizes 2 and 1.
+
+June is an engineering test because it has already been inspected in the
+zero-shot and LoRA experiments. July 2026 or later newly acquired data must be
+reserved for the next genuinely untouched evaluation.
+
+The full model is recommended over zero-shot only when common-timestamp June
+WAPE improves by at least 1% relative, the paired daily WAPE bootstrap
+interval is entirely below zero, and PV-active MAE, mean pinball loss, and
+P10-P90 coverage calibration do not materially degrade. The challenger
+artifacts remain auditable even when zero-shot remains the recommended model.
+
+Run on the school RTX 4090 server with the existing local Chronos-2 weights:
+
+```bash
+cd /data/GDUT_stu/HZZ/wind-power-chronos
+
+export CUDA_VISIBLE_DEVICES=0
+export HF_HOME=/data/GDUT_stu/.cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export CHRONOS_MODEL_PATH=/data/GDUT_stu/models/chronos-2
+export ZERO_SHOT_DIR=results/zero_shot/foshan_chronos2
+export LORA_RUN_DIR=results/fine_tune/foshan_chronos2_lora_20260723T225913Z
+export OUTPUT_DIR=results/full_fine_tune/foshan_chronos2_full_4090_v1
+
+bash scripts/run_foshan_full_finetune_4090.sh \
+  results/zero_shot/foshan_chronos2/processed_foshan_15min.parquet
+```
+
+Reusing the same `OUTPUT_DIR` skips completed candidates and continues missing
+candidates in new attempt directories without deleting partial outputs. The
+launcher runs tests, the model-free dry run, and a one-gradient-step CUDA
+smoke before the four-candidate search. It then selects on May, evaluates the
+winner once on June, and compares full tuning against the frozen zero-shot,
+LoRA, and causal predictions on the exact shared forecast keys.
+
+Results are written only under `results/full_fine_tune/`. Key files include
+`search/search_log.csv`, `search/selected_configuration.json`,
+`search/common_scored_metrics_june.csv`,
+`search/paired_daily_errors_vs_zero_shot.csv`,
+`search/paired_daily_bootstrap.json`, and
+`search/retention_decision.json`.
 
 ## Chronos-2 LoRA Fine-Tuning
 
