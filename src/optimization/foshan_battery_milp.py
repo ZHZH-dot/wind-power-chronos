@@ -65,6 +65,24 @@ class DispatchParameters:
 
 
 @dataclass(frozen=True)
+class TerminalBand:
+    """Soft end-of-horizon SOC band for receding-horizon dispatch."""
+
+    lower_kwh: float
+    upper_kwh: float
+    reference_kwh: float = 900.0
+    deviation_penalty_yuan_per_kwh: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.lower_kwh > self.upper_kwh:
+            raise ValueError("Terminal band lower_kwh must not exceed upper_kwh.")
+        if not self.lower_kwh <= self.reference_kwh <= self.upper_kwh:
+            raise ValueError("Terminal band reference_kwh must lie inside the band.")
+        if self.deviation_penalty_yuan_per_kwh < 0:
+            raise ValueError("Terminal deviation penalty must be nonnegative.")
+
+
+@dataclass(frozen=True)
 class VariableBlocks:
     """Column indices for each variable block in the HiGHS model."""
 
@@ -228,6 +246,7 @@ def solve_dispatch(
     mip_relative_gap: float = 1e-7,
     time_limit_seconds: float | None = None,
     log_to_console: bool = True,
+    terminal_band: TerminalBand | None = None,
 ) -> DispatchSolution:
     """Construct and solve the battery MILP directly with highspy."""
     missing = [column for column in REQUIRED_INPUT_COLUMNS if column not in table]
@@ -247,14 +266,58 @@ def solve_dispatch(
     price = table["price"].to_numpy(dtype=np.float64)
     residual_load = np.maximum(load - pv, 0.0)
     baseline_import = residual_load
+    if terminal_band is not None:
+        if terminal_band.lower_kwh < 0:
+            raise ValueError("Terminal band lower_kwh must be nonnegative.")
+        if terminal_band.upper_kwh > parameters.capacity_kwh:
+            raise ValueError("Terminal band upper_kwh exceeds battery capacity.")
+    if "charge_limit_kw" in table:
+        requested_charge_limit = table["charge_limit_kw"].to_numpy(
+            dtype=np.float64
+        )
+        if (
+            not np.isfinite(requested_charge_limit).all()
+            or (requested_charge_limit < 0).any()
+        ):
+            raise ValueError("charge_limit_kw must be finite and nonnegative.")
+    else:
+        requested_charge_limit = np.full(
+            interval_count, parameters.power_limit_kw
+        )
+    charge_limit = np.minimum(
+        requested_charge_limit, parameters.power_limit_kw
+    )
+    if "discharge_limit_kw" in table:
+        requested_discharge_limit = table["discharge_limit_kw"].to_numpy(
+            dtype=np.float64
+        )
+        if (
+            not np.isfinite(requested_discharge_limit).all()
+            or (requested_discharge_limit < 0).any()
+        ):
+            raise ValueError("discharge_limit_kw must be finite and nonnegative.")
+    else:
+        requested_discharge_limit = residual_load
+    discharge_limit = np.minimum.reduce(
+        (
+            requested_discharge_limit,
+            residual_load,
+            np.full(interval_count, parameters.power_limit_kw),
+        )
+    )
     blocks = _variable_blocks(interval_count)
+    terminal_negative_index = blocks.count if terminal_band is not None else None
+    terminal_positive_index = (
+        blocks.count + 1 if terminal_band is not None else None
+    )
+    variable_count = blocks.count + (2 if terminal_band is not None else 0)
 
-    lower = np.zeros(blocks.count, dtype=np.float64)
-    upper = np.empty(blocks.count, dtype=np.float64)
-    costs = np.zeros(blocks.count, dtype=np.float64)
+    lower = np.zeros(variable_count, dtype=np.float64)
+    upper = np.empty(variable_count, dtype=np.float64)
+    costs = np.zeros(variable_count, dtype=np.float64)
 
-    upper[blocks.charge] = parameters.power_limit_kw
-    upper[blocks.discharge] = parameters.power_limit_kw
+    upper[blocks.charge] = charge_limit
+    upper[blocks.discharge] = discharge_limit
     upper[blocks.soc] = parameters.capacity_kwh
     upper[blocks.grid_import] = baseline_import + parameters.power_limit_kw
     upper[blocks.grid_export] = pv
@@ -263,8 +326,20 @@ def solve_dispatch(
 
     lower[blocks.soc[0]] = parameters.initial_soc_kwh
     upper[blocks.soc[0]] = parameters.initial_soc_kwh
-    lower[blocks.soc[-1]] = parameters.terminal_soc_kwh
-    upper[blocks.soc[-1]] = parameters.terminal_soc_kwh
+    if terminal_band is None:
+        lower[blocks.soc[-1]] = parameters.terminal_soc_kwh
+        upper[blocks.soc[-1]] = parameters.terminal_soc_kwh
+    else:
+        assert terminal_negative_index is not None
+        assert terminal_positive_index is not None
+        upper[terminal_negative_index] = highspy.kHighsInf
+        upper[terminal_positive_index] = highspy.kHighsInf
+        costs[terminal_negative_index] = (
+            -terminal_band.deviation_penalty_yuan_per_kwh
+        )
+        costs[terminal_positive_index] = (
+            -terminal_band.deviation_penalty_yuan_per_kwh
+        )
 
     costs[blocks.grid_import] = (
         -parameters.storage_revenue_share * price * parameters.interval_hours
@@ -363,7 +438,23 @@ def solve_dispatch(
             (blocks.discharge[position],),
             (1.0,),
             -infinity,
-            residual_load[position],
+            discharge_limit[position],
+        )
+
+    if terminal_band is not None:
+        assert terminal_negative_index is not None
+        assert terminal_positive_index is not None
+        add_row(
+            (blocks.soc[-1], terminal_negative_index),
+            (1.0, 1.0),
+            terminal_band.lower_kwh,
+            infinity,
+        )
+        add_row(
+            (blocks.soc[-1], terminal_positive_index),
+            (1.0, -1.0),
+            -infinity,
+            terminal_band.upper_kwh,
         )
 
     highs = highspy.Highs()
@@ -394,12 +485,12 @@ def solve_dispatch(
     empty_values = np.empty(0, dtype=np.float64)
     _check_highs_status(
         highs.addCols(
-            blocks.count,
+            variable_count,
             costs,
             lower,
             upper,
             0,
-            np.zeros(blocks.count, dtype=np.int32),
+            np.zeros(variable_count, dtype=np.int32),
             empty_indices,
             empty_values,
         ),
@@ -461,6 +552,8 @@ def solve_dispatch(
         "num_nonzeros": int(highs.getNumNz()),
         "mip_relative_gap_tolerance": mip_relative_gap,
         "time_limit_seconds": time_limit_seconds,
+        "charge_limit_column_used": "charge_limit_kw" in table,
+        "discharge_limit_column_used": "discharge_limit_kw" in table,
     }
     if model_status != highspy.HighsModelStatus.kOptimal:
         raise RuntimeError(
@@ -478,6 +571,24 @@ def solve_dispatch(
     dispatch["grid_export_kw"] = solution[blocks.grid_export]
     dispatch["battery_mode"] = np.rint(solution[blocks.battery_mode]).astype(np.int8)
     dispatch["grid_import_mode"] = np.rint(solution[blocks.grid_mode]).astype(np.int8)
+    if terminal_band is not None:
+        assert terminal_negative_index is not None
+        assert terminal_positive_index is not None
+        negative_deviation = float(solution[terminal_negative_index])
+        positive_deviation = float(solution[terminal_positive_index])
+        solver_metadata.update(
+            {
+                "terminal_band_lower_kwh": terminal_band.lower_kwh,
+                "terminal_band_upper_kwh": terminal_band.upper_kwh,
+                "terminal_soc_reference_kwh": terminal_band.reference_kwh,
+                "terminal_deviation_negative_kwh": negative_deviation,
+                "terminal_deviation_positive_kwh": positive_deviation,
+                "terminal_deviation_penalty_yuan": (
+                    (negative_deviation + positive_deviation)
+                    * terminal_band.deviation_penalty_yuan_per_kwh
+                ),
+            }
+        )
 
     return DispatchSolution(
         dispatch=dispatch,

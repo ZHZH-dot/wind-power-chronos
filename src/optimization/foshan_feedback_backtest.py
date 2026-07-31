@@ -27,6 +27,7 @@ from src.optimization.foshan_forecast_backtest import (
     VALIDATION_NOTICE,
     StrategyResult,
     audit_strategy,
+    clipping_energy_kwh,
     load_reference_dispatch,
     load_selected_chronos_p50,
     perfect_forecast,
@@ -382,8 +383,8 @@ def run_feedback_strategy(
                 "realized_terminal_soc_kwh": current_soc,
                 "terminal_difference_kwh": current_soc - last_terminal_target,
                 "clipped_intervals": int(day_replay["was_clipped"].sum()),
-                "clipped_energy_kwh": float(
-                    day_replay["total_clip_kw"].sum() * parameters.interval_hours
+                "clipped_energy_kwh": clipping_energy_kwh(
+                    day_replay["total_clip_kw"], parameters.interval_hours
                 ),
                 "replan_count": len(control_times),
                 "solver_status": sorted(set(statuses))[0],
@@ -444,16 +445,16 @@ def summarize_result(
         "executed_charge_kwh": float(replay["applied_charge_kw"].sum() * dt),
         "executed_discharge_kwh": float(replay["applied_discharge_kw"].sum() * dt),
         "clipped_intervals": int(replay["was_clipped"].sum()),
-        "clipped_energy_kwh": float(replay["total_clip_kw"].sum() * dt),
+        "clipped_energy_kwh": clipping_energy_kwh(replay["total_clip_kw"], dt),
         "power_clip_intervals": int((replay["power_clip_kw"] > 1e-7).sum()),
-        "power_clipped_kwh": float(replay["power_clip_kw"].sum() * dt),
+        "power_clipped_kwh": clipping_energy_kwh(replay["power_clip_kw"], dt),
         "soc_clip_intervals": int((replay["soc_clip_kw"] > 1e-7).sum()),
-        "soc_clipped_kwh": float(replay["soc_clip_kw"].sum() * dt),
+        "soc_clipped_kwh": clipping_energy_kwh(replay["soc_clip_kw"], dt),
         "anti_export_clip_intervals": int(
             (replay["anti_export_clip_kw"] > 1e-7).sum()
         ),
-        "anti_export_clipped_kwh": float(
-            replay["anti_export_clip_kw"].sum() * dt
+        "anti_export_clipped_kwh": clipping_energy_kwh(
+            replay["anti_export_clip_kw"], dt
         ),
         **accounting,
     }
@@ -490,8 +491,8 @@ def daily_revenue_table(
                         * parameters.interval_hours
                     ),
                     "clipped_intervals": int(table["was_clipped"].sum()),
-                    "clipped_energy_kwh": float(
-                        table["total_clip_kw"].sum() * parameters.interval_hours
+                    "clipped_energy_kwh": clipping_energy_kwh(
+                        table["total_clip_kw"], parameters.interval_hours
                     ),
                     **accounting,
                 }

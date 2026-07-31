@@ -54,6 +54,17 @@ class StrategyResult:
     daily_runs: list[dict[str, Any]]
 
 
+def clipping_energy_kwh(
+    clip_kw: pd.Series | np.ndarray | list[float],
+    interval_hours: float = 1.0 / 12.0,
+) -> float:
+    """Convert interval clipping power to energy using the five-minute duration."""
+    values = np.asarray(clip_kw, dtype=float)
+    if not np.isfinite(values).all() or (values < -1e-9).any():
+        raise ValueError("Clipping power must be finite and nonnegative.")
+    return float(np.sum(np.maximum(values, 0.0) * interval_hours))
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -340,9 +351,9 @@ def replay_day(
         power_clip_kw = (scheduled_charge - charge_after_power) + (
             scheduled_discharge - discharge_after_power
         )
-        soc_clip_kw = (charge_after_power - applied_charge) + (
-            discharge_after_power - discharge_after_soc
-        )
+        upper_soc_clip_kw = charge_after_power - applied_charge
+        lower_soc_clip_kw = discharge_after_power - discharge_after_soc
+        soc_clip_kw = upper_soc_clip_kw + lower_soc_clip_kw
         anti_export_clip_kw = discharge_after_soc - applied_discharge
         total_clip_kw = power_clip_kw + soc_clip_kw + anti_export_clip_kw
 
@@ -364,6 +375,8 @@ def replay_day(
                 "grid_export_kw": grid_export,
                 "power_clip_kw": power_clip_kw,
                 "soc_clip_kw": soc_clip_kw,
+                "upper_soc_clip_kw": upper_soc_clip_kw,
+                "lower_soc_clip_kw": lower_soc_clip_kw,
                 "anti_export_clip_kw": anti_export_clip_kw,
                 "total_clip_kw": total_clip_kw,
                 "was_clipped": total_clip_kw > tolerance,
@@ -470,8 +483,8 @@ def run_daily_strategy(
                 "realized_terminal_soc_kwh": realized_end_soc,
                 "terminal_difference_kwh": realized_end_soc - current_soc,
                 "clipped_intervals": int(replay["was_clipped"].sum()),
-                "clipped_energy_kwh": float(
-                    replay["total_clip_kw"].sum() * parameters.interval_hours
+                "clipped_energy_kwh": clipping_energy_kwh(
+                    replay["total_clip_kw"], parameters.interval_hours
                 ),
                 "forecast_objective_yuan": solved.solver_objective_yuan,
                 "solver_status": solved.solver_metadata.get("solver_status"),
@@ -619,8 +632,8 @@ def summarize_strategy(
             sum(daily_terminal_differences) if daily_terminal_differences else None
         ),
         "clipped_intervals": int(replay["was_clipped"].sum()),
-        "clipped_energy_kwh": float(
-            replay["total_clip_kw"].sum() * parameters.interval_hours
+        "clipped_energy_kwh": clipping_energy_kwh(
+            replay["total_clip_kw"], parameters.interval_hours
         ),
         **accounting,
     }
@@ -711,14 +724,14 @@ def audit_strategy(
             sum(daily_terminal_differences) if daily_terminal_differences else None
         ),
         "clipped_intervals": int(replay["was_clipped"].sum()),
-        "power_clipped_kwh": float(
-            replay["power_clip_kw"].sum() * parameters.interval_hours
+        "power_clipped_kwh": clipping_energy_kwh(
+            replay["power_clip_kw"], parameters.interval_hours
         ),
-        "soc_clipped_kwh": float(
-            replay["soc_clip_kw"].sum() * parameters.interval_hours
+        "soc_clipped_kwh": clipping_energy_kwh(
+            replay["soc_clip_kw"], parameters.interval_hours
         ),
-        "anti_export_clipped_kwh": float(
-            replay["anti_export_clip_kw"].sum() * parameters.interval_hours
+        "anti_export_clipped_kwh": clipping_energy_kwh(
+            replay["anti_export_clip_kw"], parameters.interval_hours
         ),
         "daily_solver_statuses": sorted(
             {str(day["solver_status"]) for day in result.daily_runs}
