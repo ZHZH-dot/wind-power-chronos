@@ -16,6 +16,7 @@ from src.optimization.foshan_feedback_controller_v2 import (
     FINAL_TERMINAL_UPPER_KWH,
     TERMINAL_SOC_REFERENCE_KWH,
     _accounting_frame,
+    compare_v2,
     completed_day_q10,
     run_controller_v2,
     safe_residual_limit,
@@ -388,6 +389,112 @@ def test_controller_v2_disables_charging_until_high_soc_recovers(
     assert all(row["terminal_recovery_active"] for row in replans)
     assert result.replay["terminal_recovery_active"].all()
     assert result.replay["realized_soc_end_kwh"].iloc[-1] == pytest.approx(1000.0)
+
+
+def test_controller_feature_flags_disable_q10_and_recovery_ban(
+    tmp_path: Path,
+) -> None:
+    realized = _day("2026-05-02", pv=0.0, load=1000.0)
+    pv_forecast, load_forecast = _forecasts(realized)
+    calls: list[pd.DataFrame] = []
+
+    def fake_solver(table, log_path, parameters, terminal_band, **kwargs):
+        calls.append(table.copy())
+        return DispatchSolution(
+            dispatch=_fake_dispatch(table, parameters, charge_first_three=False),
+            solver_objective_yuan=0.0,
+            solver_metadata={
+                "solver_status": "Optimal",
+                "optimality_gap": 0.0,
+                "mip_dual_bound": 0.0,
+                "wall_clock_runtime_seconds": 0.0,
+                "terminal_deviation_negative_kwh": 0.0,
+                "terminal_deviation_positive_kwh": 50.0,
+                "terminal_deviation_penalty_yuan": 50.0,
+            },
+        )
+
+    result, replans = run_controller_v2(
+        "controller_v2_previous_day_pv_previous_day_load",
+        realized,
+        pv_forecast,
+        load_forecast,
+        1000.0,
+        tmp_path,
+        solver=fake_solver,
+        start=pd.Timestamp("2026-05-02"),
+        end_exclusive=pd.Timestamp("2026-05-03"),
+        initial_residual_error_history=[
+            (pd.Timestamp("2026-05-01 00:00"), -120.0),
+            (pd.Timestamp("2026-05-01 00:05"), -80.0),
+        ],
+        use_q10_discharge_limit=False,
+        use_terminal_recovery_charge_ban=False,
+    )
+
+    assert calls[0]["discharge_limit_kw"].eq(11.0).all()
+    assert calls[0]["charge_limit_kw"].eq(1000.0).all()
+    assert all(row["residual_error_q10_kw"] == pytest.approx(-116.0) for row in replans)
+    assert all(row["applied_residual_error_q10_kw"] == 0.0 for row in replans)
+    assert not result.replay["terminal_recovery_active"].any()
+    assert result.daily_runs[0]["terminal_recovery_replans"] == 0
+    assert result.daily_runs[0]["charging_disabled_intervals"] == 0
+
+
+def test_follow_up_rule_uses_interval_or_energy_clipping_fraction() -> None:
+    rows = []
+    pairs = (
+        (
+            "feedback_previous_day_pv_previous_day_load",
+            "controller_v2_previous_day_pv_previous_day_load",
+            0.01,
+            0.11,
+        ),
+        (
+            "feedback_chronos_pv_previous_day_load",
+            "controller_v2_chronos_pv_previous_day_load",
+            0.11,
+            0.01,
+        ),
+    )
+    for old, new, interval_fraction, energy_fraction in pairs:
+        rows.append(
+            {
+                "strategy": old,
+                "objective_yuan": 100.0,
+                "final_soc_kwh": 900.0,
+                "anti_export_clipped_kwh": 0.0,
+                "anti_export_clipped_fraction": 0.0,
+                "anti_export_clipped_kwh_per_planned_discharge_kwh": 0.0,
+                "solver_failures": 0,
+                "solver_runtime_seconds": 0.0,
+                "maximum_constraint_violation": 0.0,
+            }
+        )
+        rows.append(
+            {
+                "strategy": new,
+                "objective_yuan": 99.0,
+                "final_soc_kwh": 900.0,
+                "anti_export_clipped_kwh": 1.0,
+                "anti_export_clipped_fraction": interval_fraction,
+                "anti_export_clipped_kwh_per_planned_discharge_kwh": energy_fraction,
+                "solver_failures": 0,
+                "solver_runtime_seconds": 0.0,
+                "maximum_constraint_violation": 0.0,
+            }
+        )
+
+    comparison = compare_v2(pd.DataFrame(rows))
+
+    assert comparison["optional_five_minute_experiment_recommended"] is True
+    assert (
+        comparison["comparisons"]["previous_day"][
+            "anti_export_clipped_kwh_per_planned_discharge_kwh"
+        ]
+        == pytest.approx(0.11)
+    )
+    assert " OR " in comparison["recommendation_threshold"]
 
 
 def test_q10_is_frozen_within_day_and_soc_propagates_between_days(

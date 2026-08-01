@@ -318,6 +318,8 @@ def run_controller_v2(
     mip_relative_gap: float = 1e-7,
     show_progress: bool = False,
     initial_residual_error_history: list[tuple[pd.Timestamp, float]] | None = None,
+    use_q10_discharge_limit: bool = True,
+    use_terminal_recovery_charge_ban: bool = True,
 ) -> tuple[StrategyResult, list[dict[str, Any]]]:
     """Run fixed-forecast receding control with causal residual protection."""
     if name not in V2_STRATEGIES:
@@ -350,12 +352,14 @@ def run_controller_v2(
         day_start_soc = current_soc
         terminal_band = terminal_band_for_day(day)
         terminal_recovery_active = bool(
-            current_soc > terminal_band.upper_kwh + 1e-7
+            use_terminal_recovery_charge_ban
+            and current_soc > terminal_band.upper_kwh + 1e-7
         )
         q10_error, sample_count, q10_fallback_used = completed_day_q10(
             residual_error_history,
             day,
         )
+        applied_q10_error = q10_error if use_q10_discharge_limit else 0.0
         day_forecast = forecast.loc[
             (forecast["timestamp"] >= day) & (forecast["timestamp"] < day_end)
         ].copy()
@@ -379,12 +383,15 @@ def run_controller_v2(
             day, day_end, freq=f"{cadence_minutes}min", inclusive="left"
         )
         for control_time in control_times:
-            if current_soc > terminal_band.upper_kwh + 1e-7:
-                terminal_recovery_active = True
-            elif (
-                terminal_recovery_active
-                and current_soc <= TERMINAL_SOC_REFERENCE_KWH + 1e-7
-            ):
+            if use_terminal_recovery_charge_ban:
+                if current_soc > terminal_band.upper_kwh + 1e-7:
+                    terminal_recovery_active = True
+                elif (
+                    terminal_recovery_active
+                    and current_soc <= TERMINAL_SOC_REFERENCE_KWH + 1e-7
+                ):
+                    terminal_recovery_active = False
+            else:
                 terminal_recovery_active = False
             remaining = day_forecast.loc[
                 day_forecast["timestamp"] >= control_time
@@ -392,14 +399,19 @@ def run_controller_v2(
             safe_limit = safe_residual_limit(
                 remaining["forecast_load_kw"],
                 remaining["forecast_pv_kw"],
-                q10_error,
+                applied_q10_error,
             )
             remaining["safe_residual_kw"] = safe_limit
             remaining["residual_error_q10_kw"] = q10_error
+            remaining["applied_residual_error_q10_kw"] = applied_q10_error
+            remaining["q10_discharge_limit_enabled"] = use_q10_discharge_limit
             remaining["historical_error_sample_count"] = sample_count
             remaining["q10_fallback_used"] = q10_fallback_used
             remaining["q10_quantile_method"] = Q10_QUANTILE_METHOD
             remaining["terminal_recovery_active"] = terminal_recovery_active
+            remaining["terminal_recovery_charge_ban_enabled"] = (
+                use_terminal_recovery_charge_ban
+            )
             remaining["charge_limit_kw"] = (
                 0.0 if terminal_recovery_active else parameters.power_limit_kw
             )
@@ -483,6 +495,10 @@ def run_controller_v2(
             replay["terminal_band_lower_kwh"] = terminal_band.lower_kwh
             replay["terminal_band_upper_kwh"] = terminal_band.upper_kwh
             replay["terminal_recovery_active"] = terminal_recovery_active
+            replay["q10_discharge_limit_enabled"] = use_q10_discharge_limit
+            replay["terminal_recovery_charge_ban_enabled"] = (
+                use_terminal_recovery_charge_ban
+            )
             replay["charge_limit_kw"] = remaining["charge_limit_kw"].iloc[0]
             replay["planned_terminal_deviation_negative_kwh"] = float(
                 solved.solver_metadata["terminal_deviation_negative_kwh"]
@@ -555,11 +571,16 @@ def run_controller_v2(
                     ),
                     "historical_error_sample_count": sample_count,
                     "residual_error_q10_kw": q10_error,
+                    "applied_residual_error_q10_kw": applied_q10_error,
+                    "q10_discharge_limit_enabled": use_q10_discharge_limit,
                     "q10_quantile": Q10_QUANTILE,
                     "q10_quantile_method": Q10_QUANTILE_METHOD,
                     "q10_fallback_used": q10_fallback_used,
                     "q10_history_scope": "completed_previous_days",
                     "terminal_recovery_active": terminal_recovery_active,
+                    "terminal_recovery_charge_ban_enabled": (
+                        use_terminal_recovery_charge_ban
+                    ),
                     "charge_limit_kw": float(remaining["charge_limit_kw"].iloc[0]),
                     "future_realized_pv_or_load_passed": False,
                     "known_future_tariff_passed": True,
@@ -604,6 +625,9 @@ def run_controller_v2(
                     bool(row["terminal_recovery_active"])
                     for row in replans[-len(control_times) :]
                 ),
+                "charging_disabled_intervals": int(
+                    (day_replay["charge_limit_kw"] <= 1e-7).sum()
+                ),
                 "clipped_intervals": int(day_replay["was_clipped"].sum()),
                 "clipped_energy_kwh": clipping_energy_kwh(
                     day_replay["total_clip_kw"], parameters.interval_hours
@@ -629,6 +653,11 @@ def run_controller_v2(
                 "historical_error_samples_at_day_end": len(residual_error_history),
                 "historical_error_samples_at_day_start": sample_count,
                 "residual_error_q10_kw": q10_error,
+                "applied_residual_error_q10_kw": applied_q10_error,
+                "q10_discharge_limit_enabled": use_q10_discharge_limit,
+                "terminal_recovery_charge_ban_enabled": (
+                    use_terminal_recovery_charge_ban
+                ),
                 "q10_quantile_method": Q10_QUANTILE_METHOD,
                 "q10_fallback_used": q10_fallback_used,
                 "replan_count": len(control_times),
@@ -803,6 +832,18 @@ def build_daily_summary(
                     "solver_runtime_seconds": planned.get(
                         "solver_runtime_seconds"
                     ),
+                    "residual_error_q10_kw": planned.get(
+                        "residual_error_q10_kw"
+                    ),
+                    "applied_residual_error_q10_kw": planned.get(
+                        "applied_residual_error_q10_kw"
+                    ),
+                    "terminal_recovery_replans": planned.get(
+                        "terminal_recovery_replans", 0
+                    ),
+                    "charging_disabled_intervals": planned.get(
+                        "charging_disabled_intervals", 0
+                    ),
                     **accounting,
                 }
             )
@@ -864,6 +905,17 @@ def build_strategy_summary(
                 "anti_export_clipped_kwh": clipping_energy_kwh(
                     replay["anti_export_clip_kw"], parameters.interval_hours
                 ),
+                "anti_export_clipped_kwh_per_planned_discharge_kwh": (
+                    clipping_energy_kwh(
+                        replay["anti_export_clip_kw"], parameters.interval_hours
+                    )
+                    / (
+                        float(replay["scheduled_discharge_kw"].sum())
+                        * parameters.interval_hours
+                    )
+                )
+                if float(replay["scheduled_discharge_kw"].sum()) > 0.0
+                else 0.0,
                 "upper_soc_clipped_intervals": int(
                     (replay["upper_soc_clip_kw"] > 1e-7).sum()
                 ),
@@ -969,6 +1021,12 @@ def build_strategy_summary(
                 )
                 if "replan_time" in replay
                 else 0,
+                "charging_disabled_intervals": int(
+                    (replay.get("charge_limit_kw", parameters.power_limit_kw) <= 1e-7)
+                    .sum()
+                )
+                if "charge_limit_kw" in replay
+                else 0,
                 "solver_replans": (
                     sum(int(row.get("replan_count") or 0) for row in result.daily_runs)
                     if has_solver_metadata
@@ -1017,7 +1075,12 @@ def compare_v2(summary: pd.DataFrame) -> dict[str, Any]:
         old = indexed.loc[old_name]
         new = indexed.loc[new_name]
         anti_fraction = float(new["anti_export_clipped_fraction"])
-        optional_five_minute = optional_five_minute or anti_fraction > 0.10
+        anti_energy_fraction = float(
+            new["anti_export_clipped_kwh_per_planned_discharge_kwh"]
+        )
+        optional_five_minute = optional_five_minute or (
+            anti_fraction > 0.10 or anti_energy_fraction > 0.10
+        )
         comparisons[label] = {
             "old_strategy": old_name,
             "controller_v2_strategy": new_name,
@@ -1029,6 +1092,9 @@ def compare_v2(summary: pd.DataFrame) -> dict[str, Any]:
                 new["anti_export_clipped_kwh"] - old["anti_export_clipped_kwh"]
             ),
             "anti_export_clipped_fraction": anti_fraction,
+            "anti_export_clipped_kwh_per_planned_discharge_kwh": (
+                anti_energy_fraction
+            ),
             "old_revenue_yuan": float(old["objective_yuan"]),
             "controller_v2_revenue_yuan": float(new["objective_yuan"]),
             "old_final_soc_kwh": float(old["final_soc_kwh"]),
@@ -1052,7 +1118,10 @@ def compare_v2(summary: pd.DataFrame) -> dict[str, Any]:
     return {
         "comparisons": comparisons,
         "optional_five_minute_experiment_recommended": optional_five_minute,
-        "recommendation_threshold": "anti-export clipping above 10% of intervals",
+        "recommendation_threshold": (
+            "anti-export clipped intervals / total intervals > 10% OR "
+            "anti-export clipped kWh / planned discharge kWh > 10%"
+        ),
         "terminal_energy_value_adjustment_yuan": 0.0,
     }
 
