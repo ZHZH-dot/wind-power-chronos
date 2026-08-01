@@ -274,6 +274,23 @@ def apply_intraday_load_bias(
     return np.maximum(0.0, load + bias_kw)
 
 
+def final_day_immediate_charge_limit_kw(
+    current_soc_kwh: float,
+    parameters: DispatchParameters = DispatchParameters(),
+) -> float:
+    """Return the May 31 first-action charge cap for the 905-kWh ceiling."""
+    if not np.isfinite(current_soc_kwh):
+        raise ValueError("Current SOC must be finite.")
+    return min(
+        parameters.power_limit_kw,
+        max(
+            0.0,
+            (FINAL_TERMINAL_UPPER_KWH - current_soc_kwh)
+            / (parameters.charge_efficiency * parameters.interval_hours),
+        ),
+    )
+
+
 def _add_soc_clip_components(
     replay: pd.DataFrame,
     parameters: DispatchParameters,
@@ -414,6 +431,7 @@ def run_controller_v2(
     use_terminal_recovery_charge_ban: bool = True,
     use_latest_completed_residual_for_first_step: bool = False,
     use_intraday_load_bias_correction: bool = False,
+    use_final_day_immediate_charge_guard: bool = False,
 ) -> tuple[StrategyResult, list[dict[str, Any]]]:
     """Run fixed-forecast receding control with causal residual protection."""
     if name not in V2_STRATEGIES:
@@ -572,6 +590,30 @@ def run_controller_v2(
             remaining["charge_limit_kw"] = (
                 0.0 if terminal_recovery_active else parameters.power_limit_kw
             )
+            guard_applied = bool(
+                use_final_day_immediate_charge_guard
+                and pd.Timestamp(control_time).normalize() == FINAL_DAY
+            )
+            immediate_charge_limit_kw = float(
+                remaining["charge_limit_kw"].iloc[0]
+            )
+            if guard_applied:
+                immediate_charge_limit_kw = min(
+                    immediate_charge_limit_kw,
+                    final_day_immediate_charge_limit_kw(
+                        current_soc,
+                        parameters,
+                    ),
+                )
+                remaining.at[
+                    remaining.index[0], "charge_limit_kw"
+                ] = immediate_charge_limit_kw
+            future_charge_limits_unrestricted = bool(
+                len(remaining) <= 1
+                or remaining["charge_limit_kw"].iloc[1:].eq(
+                    parameters.power_limit_kw
+                ).all()
+            )
             remaining_tariff = day_tariff.loc[
                 day_tariff["timestamp"] >= control_time
             ].copy()
@@ -656,6 +698,10 @@ def run_controller_v2(
             replay["terminal_recovery_charge_ban_enabled"] = (
                 use_terminal_recovery_charge_ban
             )
+            replay["final_day_immediate_charge_guard_enabled"] = (
+                use_final_day_immediate_charge_guard
+            )
+            replay["final_day_immediate_charge_guard_applied"] = guard_applied
             replay["charge_limit_kw"] = remaining["charge_limit_kw"].iloc[0]
             replay["planned_terminal_deviation_negative_kwh"] = float(
                 solved.solver_metadata["terminal_deviation_negative_kwh"]
@@ -743,6 +789,14 @@ def run_controller_v2(
                     ),
                     "intraday_load_bias_correction_enabled": (
                         use_intraday_load_bias_correction
+                    ),
+                    "final_day_immediate_charge_guard_enabled": (
+                        use_final_day_immediate_charge_guard
+                    ),
+                    "final_day_immediate_charge_guard_applied": guard_applied,
+                    "immediate_charge_limit_kw": immediate_charge_limit_kw,
+                    "future_charge_limits_unrestricted": (
+                        future_charge_limits_unrestricted
                     ),
                     "intraday_load_bias_kw": intraday_bias_kw,
                     "intraday_load_bias_sample_count": (
