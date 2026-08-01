@@ -219,6 +219,61 @@ def net_equivalent_load_pv(residual_kw: float) -> tuple[float, float]:
     return max(residual_kw, 0.0), max(-residual_kw, 0.0)
 
 
+def intraday_load_bias(
+    realized: pd.DataFrame,
+    frozen_load_forecast: pd.DataFrame,
+    control_time: pd.Timestamp,
+    *,
+    window_size: int = 12,
+    minimum_samples: int = 3,
+) -> tuple[float, int, pd.Timestamp | None, pd.Timestamp | None]:
+    """Return a causal same-day median load error over completed intervals."""
+    if window_size <= 0:
+        raise ValueError("window_size must be positive.")
+    if minimum_samples <= 0 or minimum_samples > window_size:
+        raise ValueError("minimum_samples must be in [1, window_size].")
+    day_start = pd.Timestamp(control_time).normalize()
+    completed = realized.loc[
+        (realized["timestamp"] >= day_start)
+        & (realized["timestamp"] < control_time),
+        ["timestamp", "load"],
+    ].merge(
+        frozen_load_forecast[["timestamp", "forecast_load_kw"]],
+        on="timestamp",
+        how="inner",
+        validate="one_to_one",
+    ).sort_values("timestamp").tail(window_size)
+    sample_count = len(completed)
+    if sample_count == 0:
+        return 0.0, 0, None, None
+    if not (completed["timestamp"] < control_time).all():
+        raise ValueError("Intraday load bias included a non-completed timestamp.")
+    errors = (
+        completed["load"].to_numpy(dtype=float)
+        - completed["forecast_load_kw"].to_numpy(dtype=float)
+    )
+    if not np.isfinite(errors).all():
+        raise ValueError("Intraday load errors must be finite.")
+    bias_kw = float(np.median(errors)) if sample_count >= minimum_samples else 0.0
+    return (
+        bias_kw,
+        sample_count,
+        pd.Timestamp(completed["timestamp"].iloc[0]),
+        pd.Timestamp(completed["timestamp"].iloc[-1]),
+    )
+
+
+def apply_intraday_load_bias(
+    frozen_forecast_load_kw: pd.Series | np.ndarray,
+    bias_kw: float,
+) -> np.ndarray:
+    """Apply a scalar load correction and retain nonnegative load forecasts."""
+    load = np.asarray(frozen_forecast_load_kw, dtype=float)
+    if not np.isfinite(load).all() or not np.isfinite(bias_kw):
+        raise ValueError("Frozen load forecasts and bias must be finite.")
+    return np.maximum(0.0, load + bias_kw)
+
+
 def _add_soc_clip_components(
     replay: pd.DataFrame,
     parameters: DispatchParameters,
@@ -358,6 +413,7 @@ def run_controller_v2(
     use_q10_discharge_limit: bool = True,
     use_terminal_recovery_charge_ban: bool = True,
     use_latest_completed_residual_for_first_step: bool = False,
+    use_intraday_load_bias_correction: bool = False,
 ) -> tuple[StrategyResult, list[dict[str, Any]]]:
     """Run fixed-forecast receding control with causal residual protection."""
     if name not in V2_STRATEGIES:
@@ -434,6 +490,45 @@ def run_controller_v2(
             remaining = day_forecast.loc[
                 day_forecast["timestamp"] >= control_time
             ].copy()
+            intraday_bias_kw = 0.0
+            intraday_bias_sample_count = 0
+            intraday_bias_oldest_timestamp: pd.Timestamp | None = None
+            intraday_bias_newest_timestamp: pd.Timestamp | None = None
+            if use_intraday_load_bias_correction:
+                (
+                    intraday_bias_kw,
+                    intraday_bias_sample_count,
+                    intraday_bias_oldest_timestamp,
+                    intraday_bias_newest_timestamp,
+                ) = intraday_load_bias(
+                    realized,
+                    day_forecast,
+                    control_time,
+                )
+            remaining["frozen_forecast_load_kw"] = remaining[
+                "forecast_load_kw"
+            ]
+            remaining["intraday_load_bias_kw"] = intraday_bias_kw
+            remaining["intraday_load_bias_sample_count"] = (
+                intraday_bias_sample_count
+            )
+            remaining["intraday_load_bias_oldest_timestamp"] = (
+                intraday_bias_oldest_timestamp
+            )
+            remaining["intraday_load_bias_newest_timestamp"] = (
+                intraday_bias_newest_timestamp
+            )
+            remaining["adjusted_forecast_load_kw"] = apply_intraday_load_bias(
+                remaining["frozen_forecast_load_kw"], intraday_bias_kw
+            )
+            remaining["adjusted_residual_forecast_kw"] = np.maximum(
+                remaining["adjusted_forecast_load_kw"]
+                - remaining["forecast_pv_kw"],
+                0.0,
+            )
+            remaining["forecast_load_kw"] = remaining[
+                "adjusted_forecast_load_kw"
+            ]
             first_step_source_timestamp: pd.Timestamp | None = None
             first_step_residual_kw: float | None = None
             remaining["first_step_residual_override_applied"] = False
@@ -645,6 +740,38 @@ def run_controller_v2(
                     ),
                     "latest_completed_residual_first_step_enabled": (
                         use_latest_completed_residual_for_first_step
+                    ),
+                    "intraday_load_bias_correction_enabled": (
+                        use_intraday_load_bias_correction
+                    ),
+                    "intraday_load_bias_kw": intraday_bias_kw,
+                    "intraday_load_bias_sample_count": (
+                        intraday_bias_sample_count
+                    ),
+                    "intraday_load_bias_oldest_timestamp": (
+                        intraday_bias_oldest_timestamp.isoformat()
+                        if intraday_bias_oldest_timestamp is not None
+                        else None
+                    ),
+                    "intraday_load_bias_newest_timestamp": (
+                        intraday_bias_newest_timestamp.isoformat()
+                        if intraday_bias_newest_timestamp is not None
+                        else None
+                    ),
+                    "first_step_frozen_load_forecast_kw": float(
+                        remaining["frozen_forecast_load_kw"].iloc[0]
+                    ),
+                    "first_step_frozen_pv_forecast_kw": float(
+                        day_forecast.loc[
+                            day_forecast["timestamp"].eq(control_time),
+                            "forecast_pv_kw",
+                        ].iloc[0]
+                    ),
+                    "first_step_adjusted_load_forecast_kw": float(
+                        remaining["adjusted_forecast_load_kw"].iloc[0]
+                    ),
+                    "first_step_adjusted_residual_forecast_kw": float(
+                        remaining["adjusted_residual_forecast_kw"].iloc[0]
                     ),
                     "first_step_residual_source_timestamp": (
                         first_step_source_timestamp.isoformat()
