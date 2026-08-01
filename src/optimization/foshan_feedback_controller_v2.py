@@ -182,6 +182,43 @@ def safe_residual_limit(
     return np.maximum(0.0, forecast_residual + q10_residual_error_kw)
 
 
+def latest_completed_residual(
+    realized: pd.DataFrame,
+    control_time: pd.Timestamp,
+    interval_minutes: int = 5,
+) -> tuple[pd.Timestamp, float]:
+    """Return the residual from the interval immediately before control time."""
+    expected_timestamp = pd.Timestamp(control_time) - pd.Timedelta(
+        minutes=interval_minutes
+    )
+    completed = realized.loc[
+        realized["timestamp"] < control_time,
+        ["timestamp", "pv", "load"],
+    ].tail(1)
+    if completed.empty:
+        raise ValueError(
+            f"No completed residual measurement is available before {control_time}."
+        )
+    source_timestamp = pd.Timestamp(completed["timestamp"].iloc[0])
+    if source_timestamp != expected_timestamp:
+        raise ValueError(
+            "Latest residual measurement must be exactly one five-minute "
+            f"interval before control time; expected {expected_timestamp}, "
+            f"found {source_timestamp}."
+        )
+    residual_kw = float(completed["load"].iloc[0] - completed["pv"].iloc[0])
+    if not np.isfinite(residual_kw):
+        raise ValueError("Latest completed residual measurement must be finite.")
+    return source_timestamp, residual_kw
+
+
+def net_equivalent_load_pv(residual_kw: float) -> tuple[float, float]:
+    """Represent signed residual load as a nonnegative net-equivalent load/PV pair."""
+    if not np.isfinite(residual_kw):
+        raise ValueError("Residual load must be finite.")
+    return max(residual_kw, 0.0), max(-residual_kw, 0.0)
+
+
 def _add_soc_clip_components(
     replay: pd.DataFrame,
     parameters: DispatchParameters,
@@ -320,6 +357,7 @@ def run_controller_v2(
     initial_residual_error_history: list[tuple[pd.Timestamp, float]] | None = None,
     use_q10_discharge_limit: bool = True,
     use_terminal_recovery_charge_ban: bool = True,
+    use_latest_completed_residual_for_first_step: bool = False,
 ) -> tuple[StrategyResult, list[dict[str, Any]]]:
     """Run fixed-forecast receding control with causal residual protection."""
     if name not in V2_STRATEGIES:
@@ -396,6 +434,30 @@ def run_controller_v2(
             remaining = day_forecast.loc[
                 day_forecast["timestamp"] >= control_time
             ].copy()
+            first_step_source_timestamp: pd.Timestamp | None = None
+            first_step_residual_kw: float | None = None
+            remaining["first_step_residual_override_applied"] = False
+            remaining["first_step_residual_source_timestamp"] = pd.NaT
+            remaining["first_step_measured_residual_kw"] = np.nan
+            if use_latest_completed_residual_for_first_step:
+                first_step_source_timestamp, first_step_residual_kw = (
+                    latest_completed_residual(realized, control_time)
+                )
+                first_step_load_kw, first_step_pv_kw = net_equivalent_load_pv(
+                    first_step_residual_kw
+                )
+                first_index = remaining.index[0]
+                remaining.at[first_index, "forecast_load_kw"] = first_step_load_kw
+                remaining.at[first_index, "forecast_pv_kw"] = first_step_pv_kw
+                remaining.at[
+                    first_index, "first_step_residual_override_applied"
+                ] = True
+                remaining.at[
+                    first_index, "first_step_residual_source_timestamp"
+                ] = first_step_source_timestamp
+                remaining.at[
+                    first_index, "first_step_measured_residual_kw"
+                ] = first_step_residual_kw
             safe_limit = safe_residual_limit(
                 remaining["forecast_load_kw"],
                 remaining["forecast_pv_kw"],
@@ -581,6 +643,15 @@ def run_controller_v2(
                     "terminal_recovery_charge_ban_enabled": (
                         use_terminal_recovery_charge_ban
                     ),
+                    "latest_completed_residual_first_step_enabled": (
+                        use_latest_completed_residual_for_first_step
+                    ),
+                    "first_step_residual_source_timestamp": (
+                        first_step_source_timestamp.isoformat()
+                        if first_step_source_timestamp is not None
+                        else None
+                    ),
+                    "first_step_measured_residual_kw": first_step_residual_kw,
                     "charge_limit_kw": float(remaining["charge_limit_kw"].iloc[0]),
                     "future_realized_pv_or_load_passed": False,
                     "known_future_tariff_passed": True,
