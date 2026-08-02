@@ -4,3 +4,4 @@ pyarrow
 openpyxl
 pytest
 highspy>=1.9,<2
+matplotlib
