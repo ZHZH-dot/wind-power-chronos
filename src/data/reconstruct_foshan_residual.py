@@ -58,20 +58,65 @@ def sha256_file(path: Path) -> str:
 
 
 def load_tariff_clock_profile(dispatch_path: Path) -> dict[int, str]:
-    """Return deterministic peak/shoulder/valley labels by minute of day."""
+    """Return a canonical quarter-hour tariff profile from 5- or 15-minute data."""
     table = pd.read_csv(dispatch_path, low_memory=False)
     timestamp_column = "timestamp" if "timestamp" in table else str(table.columns[0])
     if "price" not in table:
         raise ValueError(f"Tariff input {dispatch_path} has no price column.")
     timestamps = pd.to_datetime(table[timestamp_column], errors="raise")
+    if timestamps.duplicated().any():
+        raise ValueError("Tariff timestamps must be unique.")
+    if (
+        timestamps.dt.minute.mod(5).ne(0).any()
+        or timestamps.dt.second.ne(0).any()
+        or timestamps.dt.microsecond.ne(0).any()
+    ):
+        raise ValueError("Tariff timestamps must be aligned to five-minute positions.")
     minute = timestamps.dt.hour * 60 + timestamps.dt.minute
     clock = pd.DataFrame(
-        {"minute_of_day": minute, "price": pd.to_numeric(table["price"], errors="raise")}
+        {
+            "date": timestamps.dt.date,
+            "minute_of_day": minute,
+            "price": pd.to_numeric(table["price"], errors="raise"),
+        }
     )
+    five_minute_positions = set(range(0, 24 * 60, 5))
+    quarter_hour_positions = set(range(0, 24 * 60, 15))
+    actual_positions = set(int(value) for value in clock["minute_of_day"].unique())
+    if actual_positions == five_minute_positions:
+        expected_positions = five_minute_positions
+        cadence_minutes = 5
+    elif actual_positions == quarter_hour_positions:
+        expected_positions = quarter_hour_positions
+        cadence_minutes = 15
+    else:
+        raise ValueError(
+            "Tariff profile must be a complete deterministic 5- or 15-minute schedule; "
+            f"found {len(actual_positions)} clock positions."
+        )
+    for date, daily in clock.groupby("date", sort=True):
+        daily_positions = set(int(value) for value in daily["minute_of_day"])
+        if daily_positions != expected_positions:
+            raise ValueError(
+                "Tariff input contains incomplete or mixed timestamp frequencies on "
+                f"{date}: expected {len(expected_positions)} positions, "
+                f"found {len(daily_positions)}."
+            )
     grouped = clock.groupby("minute_of_day", sort=True)["price"]
     if grouped.nunique().gt(1).any():
         raise ValueError("Tariff price changes across days for the same clock interval.")
     prices = grouped.first()
+    if cadence_minutes == 5:
+        five_minute_prices = prices.rename_axis("minute_of_day").reset_index()
+        five_minute_prices["quarter_hour_start"] = (
+            five_minute_prices["minute_of_day"] // 15 * 15
+        )
+        quarter_hours = five_minute_prices.groupby("quarter_hour_start", sort=True)[
+            "price"
+        ]
+        if quarter_hours.nunique().gt(1).any():
+            raise ValueError("Tariff price changes inside a 15-minute block.")
+        prices = quarter_hours.first()
     unique = sorted(float(value) for value in prices.unique())
     if len(unique) < 2:
         raise ValueError("At least two tariff levels are required.")

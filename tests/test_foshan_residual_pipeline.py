@@ -15,6 +15,7 @@ from src.data.reconstruct_foshan_residual import (
     TARGET_LABEL,
     add_residual_calendar_covariates,
     aggregate_signed_residual_15min,
+    load_tariff_clock_profile,
     reconstruct_signed_residual,
     tariff_clock_profile_from_calendar,
 )
@@ -129,6 +130,107 @@ class FakeChronos:
                 "0.9": np.arange(len(future_df), dtype=float),
             }
         )
+
+
+def _write_tariff_csv(
+    path: Path,
+    *,
+    frequency: str,
+    days: int = 2,
+) -> pd.DataFrame:
+    steps_per_day = 288 if frequency == "5min" else 96
+    timestamps = pd.date_range(
+        "2026-05-01", periods=days * steps_per_day, freq=frequency
+    )
+    minute_of_day = timestamps.hour * 60 + timestamps.minute
+    prices = np.where(
+        minute_of_day < 480,
+        0.3,
+        np.where(minute_of_day < 1080, 0.6, 1.0),
+    )
+    table = pd.DataFrame(
+        {
+            "Unnamed: 0": timestamps,
+            "pv": 0.0,
+            "load": 100.0,
+            "price": prices,
+            "period": "not-used-for-classification",
+        }
+    )
+    table.to_csv(path, index=False)
+    return table
+
+
+def test_tariff_loader_canonicalizes_five_minutes_and_preserves_fifteen_minutes(
+    tmp_path: Path,
+) -> None:
+    five_path = tmp_path / "dispatch_5min.csv"
+    fifteen_path = tmp_path / "dispatch_15min.csv"
+    _write_tariff_csv(five_path, frequency="5min", days=31)
+    _write_tariff_csv(fifteen_path, frequency="15min", days=31)
+
+    five_profile = load_tariff_clock_profile(five_path)
+    fifteen_profile = load_tariff_clock_profile(fifteen_path)
+
+    assert len(pd.read_csv(five_path)) == 8_928
+    assert len(five_profile) == 96
+    assert set(five_profile) == set(range(0, 24 * 60, 15))
+    assert five_profile == fifteen_profile
+    assert five_profile[0] == "valley"
+    assert five_profile[480] == "shoulder"
+    assert five_profile[1080] == "peak"
+
+
+def test_tariff_loader_rejects_within_quarter_change(tmp_path: Path) -> None:
+    path = tmp_path / "within_quarter_change.csv"
+    table = _write_tariff_csv(path, frequency="5min", days=1)
+    table.loc[table["Unnamed: 0"].eq(pd.Timestamp("2026-05-01 00:05")), "price"] = 0.6
+    table.to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="inside a 15-minute block"):
+        load_tariff_clock_profile(path)
+
+
+def test_tariff_loader_rejects_missing_clock_position(tmp_path: Path) -> None:
+    path = tmp_path / "missing_clock.csv"
+    table = _write_tariff_csv(path, frequency="5min", days=2)
+    missing_clock = (
+        pd.to_datetime(table["Unnamed: 0"]).dt.hour.eq(12)
+        & pd.to_datetime(table["Unnamed: 0"]).dt.minute.eq(5)
+    )
+    table.loc[~missing_clock].to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="complete deterministic"):
+        load_tariff_clock_profile(path)
+
+
+def test_tariff_loader_rejects_cross_day_clock_price_conflict(tmp_path: Path) -> None:
+    path = tmp_path / "cross_day_conflict.csv"
+    table = _write_tariff_csv(path, frequency="5min", days=2)
+    conflict = table["Unnamed: 0"].eq(pd.Timestamp("2026-05-02 00:00"))
+    table.loc[conflict, "price"] = 0.6
+    table.to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="changes across days"):
+        load_tariff_clock_profile(path)
+
+
+def test_tariff_loader_rejects_mixed_or_nonaligned_timestamps(tmp_path: Path) -> None:
+    mixed_path = tmp_path / "mixed.csv"
+    five = _write_tariff_csv(mixed_path, frequency="5min", days=1)
+    fifteen_path = tmp_path / "fifteen.csv"
+    fifteen = _write_tariff_csv(fifteen_path, frequency="15min", days=1)
+    fifteen["Unnamed: 0"] = pd.to_datetime(fifteen["Unnamed: 0"]) + pd.Timedelta(days=1)
+    pd.concat([five, fifteen], ignore_index=True).to_csv(mixed_path, index=False)
+    with pytest.raises(ValueError, match="incomplete or mixed"):
+        load_tariff_clock_profile(mixed_path)
+
+    nonaligned_path = tmp_path / "nonaligned.csv"
+    nonaligned = _write_tariff_csv(nonaligned_path, frequency="5min", days=1)
+    nonaligned.loc[0, "Unnamed: 0"] = pd.Timestamp("2026-05-01 00:01")
+    nonaligned.to_csv(nonaligned_path, index=False)
+    with pytest.raises(ValueError, match="aligned to five-minute"):
+        load_tariff_clock_profile(nonaligned_path)
 
 
 def test_context_is_strictly_causal_calendar_only_and_issue_calls_are_independent(
