@@ -16,11 +16,13 @@ from src.data.reconstruct_foshan_residual import (
     add_residual_calendar_covariates,
     aggregate_signed_residual_15min,
     reconstruct_signed_residual,
+    tariff_clock_profile_from_calendar,
 )
 from src.models.foshan_residual_zero_shot import (
     MODEL_REVISION,
     PREDICTION_COLUMNS,
     build_inference_frames,
+    evaluate_residual_predictions,
     resolve_pinned_snapshot,
     run_residual_candidate,
 )
@@ -175,6 +177,84 @@ def test_context_is_strictly_causal_calendar_only_and_issue_calls_are_independen
     assert audit["different_issue_times_batched"].eq(False).all()
     assert (pd.to_datetime(audit["context_end"]) < pd.to_datetime(audit["issue_time"])).all()
     assert (predictions["p10"] < 0.0).any(), "Signed forecasts must not be clipped."
+
+
+def test_late_may_future_calendar_extends_beyond_realized_target_boundary(
+    tmp_path: Path,
+) -> None:
+    timestamps = pd.date_range(
+        "2026-03-01 00:00", "2026-06-01 00:00", freq="15min", tz=TZ, inclusive="left"
+    )
+    table = _residual_table(periods=len(timestamps))
+    tariff_profile = tariff_clock_profile_from_calendar(table)
+    issues = [
+        pd.Timestamp("2026-05-31 01:00", tz=TZ),
+        pd.Timestamp("2026-05-31 23:00", tz=TZ),
+    ]
+
+    for issue in issues:
+        context, future, metadata = build_inference_frames(table, issue, 672)
+        assert len(future) == 96
+        assert future[CALENDAR_COLUMNS].notna().all().all()
+        assert metadata["context_end"] < issue
+        assert context["timestamp"].max() < issue.tz_localize(None)
+        assert set(future.columns) == {"id", "timestamp", *CALENDAR_COLUMNS}
+
+        future_times = pd.DatetimeIndex(future["timestamp"]).tz_localize(TZ)
+        minute_of_day = future_times.hour * 60 + future_times.minute
+        expected_periods = pd.Series(minute_of_day).map(tariff_profile)
+        actual_periods = (
+            future[["tariff_is_peak", "tariff_is_shoulder", "tariff_is_valley"]]
+            .idxmax(axis=1)
+            .str.removeprefix("tariff_is_")
+        )
+        assert actual_periods.tolist() == expected_periods.tolist()
+        assert future[["tariff_is_peak", "tariff_is_shoulder", "tariff_is_valley"]].sum(
+            axis=1
+        ).eq(1).all()
+
+        in_range = future_times < pd.Timestamp("2026-06-01 00:00", tz=TZ)
+        previous_calendar = (
+            table.set_index("timestamp").reindex(future_times[in_range])[CALENDAR_COLUMNS]
+        )
+        pd.testing.assert_frame_equal(
+            future.loc[in_range, CALENDAR_COLUMNS].reset_index(drop=True),
+            previous_calendar.reset_index(drop=True),
+            check_dtype=True,
+        )
+
+    _, late_future, late_metadata = build_inference_frames(table, issues[1], 672)
+    assert late_metadata["target_end"] == pd.Timestamp("2026-06-01 22:45", tz=TZ)
+    assert late_future["timestamp"].iloc[-1] == pd.Timestamp("2026-06-01 22:45")
+    assert late_future["month"].iloc[:4].eq(5).all()
+    assert late_future["month"].iloc[4:].eq(6).all()
+
+    snapshot = tmp_path / MODEL_REVISION
+    snapshot.mkdir()
+    predictions, _ = run_residual_candidate(
+        FakeChronos(),
+        table,
+        issues,
+        candidate="chronos2_residual_hourly_ctx672",
+        split="may_2026_test",
+        context_length=672,
+        refresh_cadence_minutes=60,
+        snapshot=snapshot,
+        inference_batch_size=64,
+    )
+    june_boundary = pd.Timestamp("2026-06-01 00:00", tz=TZ)
+    outside_truth = predictions["target_time"] >= june_boundary
+    assert predictions.loc[outside_truth, "y_true_kw"].isna().all()
+    assert predictions.loc[outside_truth, "is_missing_target"].all()
+    assert predictions.loc[~outside_truth, "y_true_kw"].notna().all()
+
+    metrics = evaluate_residual_predictions(
+        predictions,
+        pd.Timestamp("2026-05-01 00:00", tz=TZ),
+        june_boundary,
+    )
+    overall = metrics.loc[metrics["metric_scope"].eq("overall")].iloc[0]
+    assert int(overall["n_scored"]) == int((~outside_truth).sum()) == 96
 
 
 def test_pinned_snapshot_requires_exact_revision(tmp_path: Path) -> None:

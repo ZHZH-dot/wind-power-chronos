@@ -39,6 +39,7 @@ CALENDAR_COLUMNS = [
     "tariff_is_shoulder",
     "tariff_is_valley",
 ]
+TARIFF_PERIODS = ("peak", "shoulder", "valley")
 
 
 def _site_timestamp(value: pd.Timestamp | str) -> pd.Timestamp:
@@ -77,7 +78,86 @@ def load_tariff_clock_profile(dispatch_path: Path) -> dict[int, str]:
     labels: dict[float, str] = {unique[0]: "valley", unique[-1]: "peak"}
     for value in unique[1:-1]:
         labels[value] = "shoulder"
-    return {int(key): labels[float(value)] for key, value in prices.items()}
+    return validate_tariff_clock_profile(
+        {int(key): labels[float(value)] for key, value in prices.items()}
+    )
+
+
+def validate_tariff_clock_profile(
+    tariff_profile: Mapping[int, str],
+) -> dict[int, str]:
+    """Validate one deterministic tariff label for every quarter-hour clock slot."""
+    normalized = {int(minute): str(period) for minute, period in tariff_profile.items()}
+    expected_minutes = set(range(0, 24 * 60, 15))
+    actual_minutes = set(normalized)
+    if actual_minutes != expected_minutes:
+        missing = sorted(expected_minutes - actual_minutes)
+        unexpected = sorted(actual_minutes - expected_minutes)
+        raise ValueError(
+            "Tariff clock profile must cover all 96 quarter-hour positions exactly once; "
+            f"missing={missing[:5]}, unexpected={unexpected[:5]}."
+        )
+    invalid = sorted(set(normalized.values()) - set(TARIFF_PERIODS))
+    if invalid:
+        raise ValueError(f"Tariff clock profile contains invalid periods: {invalid}")
+    return normalized
+
+
+def tariff_clock_profile_from_calendar(table: pd.DataFrame) -> dict[int, str]:
+    """Recover the audited minute-of-day tariff schedule from calendar indicators."""
+    indicator_columns = [f"tariff_is_{period}" for period in TARIFF_PERIODS]
+    missing = sorted({"timestamp", *indicator_columns} - set(table.columns))
+    if missing:
+        raise ValueError(f"Calendar table is missing tariff fields: {missing}")
+    timestamps = pd.DatetimeIndex(pd.to_datetime(table["timestamp"], errors="raise"))
+    indicators = table[indicator_columns].apply(pd.to_numeric, errors="raise")
+    if indicators.isna().any().any() or not indicators.isin([0, 1]).all().all():
+        raise ValueError("Tariff indicators must be non-null binary values.")
+    if not indicators.sum(axis=1).eq(1).all():
+        raise ValueError("Every timestamp must map to exactly one tariff period.")
+    clock = pd.DataFrame(
+        {
+            "minute_of_day": timestamps.hour * 60 + timestamps.minute,
+            "period": indicators.idxmax(axis=1).str.removeprefix("tariff_is_"),
+        }
+    )
+    grouped = clock.groupby("minute_of_day", sort=True)["period"]
+    if grouped.nunique().gt(1).any():
+        raise ValueError("Tariff period changes across days for the same clock interval.")
+    return validate_tariff_clock_profile(grouped.first().to_dict())
+
+
+def calendar_covariates_for_timestamps(
+    timestamps: pd.Series | pd.DatetimeIndex,
+    tariff_profile: Mapping[int, str],
+) -> pd.DataFrame:
+    """Generate deterministic known-future covariates from quarter-hour timestamps."""
+    index = pd.DatetimeIndex(pd.to_datetime(timestamps, errors="raise"))
+    if (
+        (index.minute % 15 != 0).any()
+        or (index.second != 0).any()
+        or (index.microsecond != 0).any()
+    ):
+        raise ValueError("Calendar timestamps must be aligned to quarter hours.")
+    profile = validate_tariff_clock_profile(tariff_profile)
+    quarter_hour = index.hour * 4 + index.minute // 15
+    hour = index.hour + index.minute / 60.0
+    minute_of_day = index.hour * 60 + index.minute
+    periods = pd.Series(minute_of_day).map(profile)
+    if periods.isna().any():
+        missing = sorted(set(minute_of_day[periods.isna()]))
+        raise ValueError(f"Tariff profile is missing clock minutes: {missing[:5]}")
+    result = pd.DataFrame({"timestamp": index})
+    result["quarter_hour_sin"] = np.sin(2.0 * np.pi * quarter_hour / 96.0)
+    result["quarter_hour_cos"] = np.cos(2.0 * np.pi * quarter_hour / 96.0)
+    result["hour_sin"] = np.sin(2.0 * np.pi * hour / 24.0)
+    result["hour_cos"] = np.cos(2.0 * np.pi * hour / 24.0)
+    result["weekday"] = index.dayofweek.astype(np.int8)
+    result["is_weekend"] = (index.dayofweek >= 5).astype(np.int8)
+    result["month"] = index.month.astype(np.int8)
+    for period in TARIFF_PERIODS:
+        result[f"tariff_is_{period}"] = periods.eq(period).astype(np.int8)
+    return result
 
 
 def add_residual_calendar_covariates(
@@ -87,23 +167,9 @@ def add_residual_calendar_covariates(
 ) -> pd.DataFrame:
     """Add known-future calendar features without using realized site variables."""
     result = table.copy()
-    timestamps = pd.DatetimeIndex(pd.to_datetime(result["timestamp"], errors="raise"))
-    quarter_hour = timestamps.hour * 4 + timestamps.minute // 15
-    hour = timestamps.hour + timestamps.minute / 60.0
-    minute_of_day = timestamps.hour * 60 + timestamps.minute
-    result["quarter_hour_sin"] = np.sin(2.0 * np.pi * quarter_hour / 96.0)
-    result["quarter_hour_cos"] = np.cos(2.0 * np.pi * quarter_hour / 96.0)
-    result["hour_sin"] = np.sin(2.0 * np.pi * hour / 24.0)
-    result["hour_cos"] = np.cos(2.0 * np.pi * hour / 24.0)
-    result["weekday"] = timestamps.dayofweek.astype(np.int8)
-    result["is_weekend"] = (timestamps.dayofweek >= 5).astype(np.int8)
-    result["month"] = timestamps.month.astype(np.int8)
-    periods = pd.Series(minute_of_day, index=result.index).map(tariff_profile)
-    if periods.isna().any():
-        missing = sorted(set(minute_of_day[periods.isna()]))
-        raise ValueError(f"Tariff profile is missing clock minutes: {missing[:5]}")
-    for period in ("peak", "shoulder", "valley"):
-        result[f"tariff_is_{period}"] = periods.eq(period).astype(np.int8)
+    calendar = calendar_covariates_for_timestamps(result["timestamp"], tariff_profile)
+    for column in CALENDAR_COLUMNS:
+        result[column] = calendar[column].to_numpy()
 
     if external_calendar is not None:
         allowed = {"timestamp", "is_factory_running", "is_holiday"}

@@ -23,7 +23,9 @@ from src.data.reconstruct_foshan_residual import (
     TARGET_COLUMN,
     TARGET_LABEL,
     TIMEZONE,
+    calendar_covariates_for_timestamps,
     sha256_file,
+    tariff_clock_profile_from_calendar,
 )
 from src.evaluation.foshan_benchmark import normalize_chronos_quantiles
 from src.models.foshan_chronos_zero_shot import run_chronos_configuration
@@ -311,9 +313,13 @@ def build_inference_frames(
     if context_times.max() >= issue:
         raise AssertionError("Residual context must end strictly before issue time.")
     context_values = source.reindex(context_times)
-    future_values = source.reindex(future_times)
+    historical_calendar = source.loc[source.index < issue].reset_index(names="timestamp")
+    tariff_profile = tariff_clock_profile_from_calendar(historical_calendar)
+    future_values = calendar_covariates_for_timestamps(future_times, tariff_profile).set_index(
+        "timestamp"
+    )
     if future_values[list(calendar_columns)].isna().any().any():
-        raise ValueError(f"Known-future calendar coverage is incomplete at {issue}.")
+        raise AssertionError(f"Generated future calendar is incomplete at {issue}.")
     item_id = "foshan_signed_residual"
     context = context_values[[TARGET_COLUMN, *calendar_columns]].reset_index(
         names="timestamp"

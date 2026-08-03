@@ -1,7 +1,7 @@
 numpy
 pandas
 pyarrow
-openpyxl
+openpyxl>=3.1,<4
 pytest
 highspy>=1.9,<2
 matplotlib
