@@ -461,6 +461,96 @@ Results are written only under `results/full_fine_tune/`. Key files include
 `search/paired_daily_bootstrap.json`, and
 `search/retention_decision.json`.
 
+### Foshan Signed Residual Revenue Pipeline
+
+This challenger freezes `controller_v5` and the direct HiGHS MILP byte for
+byte. It changes only the provisional-load forecasting representation. The
+five-minute target is:
+
+```text
+signed_residual_load_kw = net_grid_kw + pcs_kw
+```
+
+PCS positive means battery discharge and PCS negative means charge. The
+15-minute signed net-grid value is forward-filled to its three corresponding
+five-minute rows, aligned with PCS, and each three-row group is averaged back
+to a 15-minute forecast target. Negative residuals are retained. The target is
+labelled **provisional reconstructed signed residual-load proxy** and is not
+verified gross factory demand.
+
+Controller inputs are derived without changing controller policy:
+
+```text
+forecast_residual_for_discharge_kw = max(0, signed_residual_forecast_kw)
+forecast_load_kw = max(0, frozen_pv_p50_kw + signed_residual_forecast_kw)
+```
+
+The benchmark pins `amazon/chronos-2`, `chronos-forecasting==2.3.1`, and model
+revision `29ec3766d36d6f73f0696f85560a422f50e8498c`. The loader accepts only the
+revision-specific snapshot directory. Every 00:00 and hourly issue is sent to
+Chronos in a separate `predict_df()` call; target context ends at `t-15min`,
+and future data contains only calendar and tariff indicators.
+
+April 2026 alone selects candidates by equal-SOC controller revenue, with
+signed-residual WAPE and absolute bias as tie-breakers. March is the only
+fine-tuning period. May is the final counterfactual economic test and never
+participates in model or hyperparameter selection.
+
+Prepare data, run a pinned one-origin smoke, and generate zero-shot candidates:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export HF_HOME=/data/GDUT_stu/.cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export CHRONOS_MODEL_PATH="$HF_HOME/hub/models--amazon--chronos-2/snapshots/29ec3766d36d6f73f0696f85560a422f50e8498c"
+export OUTPUT_DIR=results/residual_forecast/foshan_chronos2/residual_20260802
+
+bash scripts/run_foshan_residual_zero_shot.sh \
+  '/path/to/光伏与负荷数据_202603-06.xlsx' \
+  '/path/to/储能数据20260707230737.xlsx' \
+  '/path/to/may_month_dispatch_timeseries.csv'
+```
+
+The LoRA and full launchers require exactly one RTX 4090, BF16, and GPU 0. Each
+runs tests and a model-free dry run, then a five-step smoke before its bounded
+search. LoRA searches rank 8/16, alpha 16/32, learning rate `5e-5`/`1e-4`, and
+100/300 steps. Full tuning searches learning rate `5e-6`/`1e-5` and 50/100
+steps with batch 4 and gradient accumulation 4 (effective batch 16).
+
+```bash
+export RESIDUAL_DATA=results/residual_forecast/foshan_chronos2/residual_20260802/data/signed_residual_15min.parquet
+
+OUTPUT_DIR=results/fine_tune/foshan_chronos2_residual/lora_20260802 \
+bash scripts/run_foshan_residual_lora_4090.sh "$RESIDUAL_DATA"
+
+OUTPUT_DIR=results/fine_tune/foshan_chronos2_residual/full_20260802 \
+bash scripts/run_foshan_residual_full_4090.sh "$RESIDUAL_DATA"
+```
+
+Run April revenue selection and one May evaluation for each frozen model-class
+winner. `TRAINED_RUN_DIRS` is optional; omit it for the zero-shot-only run.
+
+```bash
+export TRAINED_RUN_DIRS="$(printf '%s ' \
+  results/fine_tune/foshan_chronos2_residual/lora_20260802/search/residual_lora_* \
+  results/fine_tune/foshan_chronos2_residual/full_20260802/search/residual_full_*)"
+export RESIDUAL_DATA=results/residual_forecast/foshan_chronos2/residual_20260802/data/signed_residual_15min.parquet
+export OUTPUT_DIR=results/revenue_ablation/foshan_residual_controller_v5/revenue_20260802
+
+bash scripts/run_foshan_residual_revenue_eval.sh \
+  '/path/to/光伏与负荷数据_202603-06.xlsx' \
+  '/path/to/储能数据20260707230737.xlsx' \
+  '/path/to/may_month_dispatch_timeseries.csv' \
+  results/residual_forecast/foshan_chronos2/residual_20260802/forecast
+```
+
+Generated directories are non-overwriting. Training manifests record the exact
+base revision, predictor/checkpoint paths and hashes, trainable/total parameter
+counts, runtime, peak VRAM, and April selection result. A trained candidate is
+excluded unless its saved AutoGluon predictor and fine-tuned checkpoint reload
+successfully without falling back to the base model.
+
 ## Chronos-2 LoRA Fine-Tuning
 
 Fine-tuning reuses the same global chronological benchmark. `configs/splits/sdwpf_70_10_20.json` defines the 70% train, 10% validation, and 20% test ratios plus the 72-hour prediction length, 168-hour context, benchmark horizons, hourly frequency, and seed 42.

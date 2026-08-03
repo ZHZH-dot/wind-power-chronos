@@ -251,4 +251,4 @@ def test_autodl_script_has_cpu_dry_run_before_training() -> None:
     assert 'DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"' in script
     assert "python scripts/preflight_finetune_4090.py" in script
     assert "nvidia-smi" in script
-    assert "chronos-forecasting>=2.2.2,<2.4" in requirements
+    assert "chronos-forecasting==2.3.1" in requirements

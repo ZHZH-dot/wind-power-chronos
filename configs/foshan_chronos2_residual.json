@@ -1,0 +1,94 @@
+{
+  "benchmark_name": "foshan_chronos2_signed_residual",
+  "site_id": "foshan_site",
+  "target_label": "provisional reconstructed signed residual-load proxy",
+  "model_id": "amazon/chronos-2",
+  "model_revision": "29ec3766d36d6f73f0696f85560a422f50e8498c",
+  "chronos_forecasting_version": "2.3.1",
+  "frequency": "15min",
+  "timezone": "Asia/Shanghai",
+  "prediction_length": 96,
+  "quantile_levels": [0.1, 0.5, 0.9],
+  "context_lengths": [672, 1344, 2688],
+  "daily_context_length": 1344,
+  "training_context_length": 672,
+  "refresh_cadence_minutes": 60,
+  "inference_batch_size": 64,
+  "seed": 42,
+  "causal_fill_limit": 3,
+  "data_period": {
+    "start": "2026-03-01T00:00:00+08:00",
+    "end_exclusive": "2026-06-01T00:00:00+08:00"
+  },
+  "train_period": {
+    "start": "2026-03-01T00:00:00+08:00",
+    "end_exclusive": "2026-04-01T00:00:00+08:00"
+  },
+  "selection_period": {
+    "name": "april_2026_selection",
+    "start": "2026-04-01T00:00:00+08:00",
+    "end_exclusive": "2026-05-01T00:00:00+08:00"
+  },
+  "test_period": {
+    "name": "may_2026_economic_test",
+    "start": "2026-05-01T00:00:00+08:00",
+    "end_exclusive": "2026-06-01T00:00:00+08:00"
+  },
+  "calendar_covariates": [
+    "quarter_hour_sin",
+    "quarter_hour_cos",
+    "hour_sin",
+    "hour_cos",
+    "weekday",
+    "is_weekend",
+    "month",
+    "tariff_is_peak",
+    "tariff_is_shoulder",
+    "tariff_is_valley"
+  ],
+  "zero_shot_candidates": [
+    {
+      "name": "chronos2_residual_daily_ctx1344",
+      "context_length": 1344,
+      "refresh_cadence_minutes": 1440
+    },
+    {
+      "name": "chronos2_residual_hourly_ctx672",
+      "context_length": 672,
+      "refresh_cadence_minutes": 60
+    },
+    {
+      "name": "chronos2_residual_hourly_ctx1344",
+      "context_length": 1344,
+      "refresh_cadence_minutes": 60
+    },
+    {
+      "name": "chronos2_residual_hourly_ctx2688",
+      "context_length": 2688,
+      "refresh_cadence_minutes": 60
+    }
+  ],
+  "lora_search": {
+    "ranks": [8, 16],
+    "alphas": [16, 32],
+    "learning_rates": [5e-5, 1e-4],
+    "steps": [100, 300],
+    "batch_size": 8,
+    "smoke_steps": 5
+  },
+  "full_search": {
+    "learning_rates": [5e-6, 1e-5],
+    "steps": [50, 100],
+    "batch_size": 4,
+    "gradient_accumulation_steps": 4,
+    "effective_batch_size": 16,
+    "smoke_steps": 5
+  },
+  "frozen_source_sha256": {
+    "src/optimization/foshan_feedback_controller_v5.py": "5acbd5c8ad53ef1c8c6d57a7f5cd45d57c8e75ff077cd70fb23e1e648869ced9",
+    "src/optimization/foshan_feedback_controller_v2.py": "1466bc673b5a9c96918f330f724f1fae5e55e113348894ced5247f12e3ce7e34",
+    "src/optimization/foshan_forecast_backtest.py": "bd5f15fc977f5bf31c9be1848a565fc11a4e327b3f967027578f4b81bab60974",
+    "src/optimization/foshan_battery_milp.py": "d299d1d946340018cde78d0edbc00bdff1dfd706c465647e244f67abedb842f7",
+    "src/optimization/foshan_controller_v5_final_benchmark.py": "b13da51e2749fd9f6c386be090c4777c327fdc961db0a8ba508abaaf83b31d29"
+  }
+}

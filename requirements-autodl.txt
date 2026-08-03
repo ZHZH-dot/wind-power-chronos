@@ -1,4 +1,4 @@
-chronos-forecasting>=2.2.2,<2.4
+chronos-forecasting==2.3.1
 torch
 pandas
 pyarrow
