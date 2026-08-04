@@ -505,6 +505,10 @@ def test_selection_rejects_june_metrics_and_uses_deterministic_may_tie_break() -
     selected = select_may_configurations(may)
 
     assert selected["targets"]["pv_kw"]["model_name"] == "chronos2_pv_calendar"
+    assert (
+        selected["targets"]["pv_kw"]["postprocessing"]
+        == "physical_clip_0_1700"
+    )
     june = may.copy()
     june["split"] = "june_2026_test"
     with pytest.raises(ValueError, match="May metrics only"):

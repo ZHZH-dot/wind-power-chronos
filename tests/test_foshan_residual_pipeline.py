@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.data.prepare_foshan import ParsedSignal
+from src.data.prepare_foshan import ParsedSignal, add_calendar_covariates
 from src.data.reconstruct_foshan_provisional_load import ProvisionalLoadSignals
 from src.data.reconstruct_foshan_residual import (
     CALENDAR_COLUMNS,
@@ -20,13 +20,19 @@ from src.data.reconstruct_foshan_residual import (
     tariff_clock_profile_from_calendar,
 )
 from src.models.foshan_residual_zero_shot import (
+    DEFAULT_PV_CONFIG,
+    DEFAULT_PV_SELECTION,
+    FROZEN_PV_POSTPROCESSING,
     MODEL_REVISION,
     PREDICTION_COLUMNS,
     build_inference_frames,
     evaluate_residual_predictions,
+    generate_frozen_april_pv,
     resolve_pinned_snapshot,
     run_residual_candidate,
+    validate_frozen_april_pv_rows,
 )
+import src.models.foshan_residual_zero_shot as residual_zero_shot
 from src.optimization.foshan_battery_milp import DispatchSolution
 from src.optimization.foshan_controller_v5_final_benchmark import summarize_result
 from src.optimization.foshan_residual_controller_eval import (
@@ -130,6 +136,239 @@ class FakeChronos:
                 "0.9": np.arange(len(future_df), dtype=float),
             }
         )
+
+
+class FakePvChronos:
+    def predict_df(
+        self,
+        context_df: pd.DataFrame,
+        *,
+        future_df: pd.DataFrame | None,
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        targets = kwargs["target"]
+        target_names = [targets] if isinstance(targets, str) else list(targets)
+        prediction_length = int(kwargs["prediction_length"])
+        timestamps = (
+            pd.DatetimeIndex(future_df["timestamp"])
+            if future_df is not None
+            else pd.date_range(
+                context_df["timestamp"].max() + pd.Timedelta(minutes=15),
+                periods=prediction_length,
+                freq="15min",
+            )
+        )
+        rows: list[dict[str, object]] = []
+        for target in target_names:
+            for timestamp in timestamps:
+                pv = target == "pv_kw"
+                rows.append(
+                    {
+                        "id": "foshan_site",
+                        "timestamp": timestamp,
+                        "target_name": target,
+                        "0.1": -10.0 if pv else -50.0,
+                        "0.5": 500.0 if pv else 25.0,
+                        "0.9": 1800.0 if pv else 100.0,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+
+def _processed_foshan_table() -> pd.DataFrame:
+    periods = 96 * 34
+    timestamps = pd.date_range(
+        "2026-03-01", periods=periods, freq="15min", tz=TZ
+    )
+    slot = np.arange(periods) % 96
+    pv = np.maximum(0.0, np.sin((slot - 24) * np.pi / 48.0)) * 1000.0
+    table = pd.DataFrame(
+        {
+            "id": "foshan_site",
+            "timestamp": timestamps,
+            "pv_kw_raw": pv,
+            "pv_kw": pv,
+            "net_grid_kw_raw": 100.0,
+            "net_grid_kw": 100.0,
+            "is_missing_pv_kw": False,
+            "is_missing_net_grid_kw": False,
+            "is_corrected_pv_kw": False,
+        }
+    )
+    return add_calendar_covariates(table)
+
+
+def _write_pv_selection(
+    path: Path,
+    model_name: str,
+    *,
+    postprocessing: str | None,
+) -> None:
+    selected: dict[str, object] = {
+        "model_name": model_name,
+        "context_length": 672,
+    }
+    if postprocessing is not None:
+        selected["postprocessing"] = postprocessing
+    path.write_text(
+        json.dumps({"targets": {"pv_kw": selected}}), encoding="utf-8"
+    )
+
+
+def _run_fake_frozen_pv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model_name: str,
+    postprocessing: str | None,
+    max_origins: int,
+) -> tuple[pd.DataFrame, list[int]]:
+    table_path = tmp_path / f"processed_{model_name}_{max_origins}.parquet"
+    selection_path = tmp_path / f"selection_{model_name}_{max_origins}.json"
+    _processed_foshan_table().to_parquet(table_path, index=False)
+    _write_pv_selection(
+        selection_path, model_name, postprocessing=postprocessing
+    )
+    internal_counts: list[int] = []
+    original = residual_zero_shot.run_chronos_configuration
+
+    def recording_run(*args: object, **kwargs: object):
+        result = original(*args, **kwargs)
+        internal_counts.append(len(result[0]))
+        return result
+
+    monkeypatch.setattr(
+        residual_zero_shot, "run_chronos_configuration", recording_run
+    )
+    rows = generate_frozen_april_pv(
+        FakePvChronos(),
+        table_path,
+        DEFAULT_PV_CONFIG,
+        selection_path,
+        "fake-chronos-2",
+        max_origins=max_origins,
+    )
+    return rows, internal_counts
+
+
+def test_frozen_pv_legacy_selection_keeps_one_physical_variant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows, internal_counts = _run_fake_frozen_pv(
+        tmp_path,
+        monkeypatch,
+        model_name="chronos2_pv_univariate",
+        postprocessing=None,
+        max_origins=1,
+    )
+
+    assert internal_counts == [192]
+    assert len(rows) == 96
+    assert rows["postprocessing"].eq(FROZEN_PV_POSTPROCESSING).all()
+    assert rows["target"].eq("pv_kw").all()
+    assert rows["horizon_step"].tolist() == list(range(1, 97))
+
+
+def test_frozen_pv_explicit_selection_returns_two_complete_origins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows, internal_counts = _run_fake_frozen_pv(
+        tmp_path,
+        monkeypatch,
+        model_name="chronos2_pv_univariate",
+        postprocessing=FROZEN_PV_POSTPROCESSING,
+        max_origins=2,
+    )
+
+    assert internal_counts == [384]
+    assert len(rows) == 192
+    assert rows.groupby("issue_time").size().eq(96).all()
+    assert not rows.duplicated(["issue_time", "target_time", "horizon_step"]).any()
+
+
+def test_frozen_pv_joint_selection_excludes_provisional_grid_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows, internal_counts = _run_fake_frozen_pv(
+        tmp_path,
+        monkeypatch,
+        model_name="chronos2_joint_calendar",
+        postprocessing=FROZEN_PV_POSTPROCESSING,
+        max_origins=1,
+    )
+
+    assert internal_counts == [288]
+    assert len(rows) == 96
+    assert rows["target"].eq("pv_kw").all()
+    assert rows["model_name"].eq("chronos2_joint_calendar").all()
+
+
+def _valid_frozen_pv_rows() -> tuple[pd.DataFrame, list[pd.Timestamp]]:
+    origin = pd.Timestamp("2026-04-01", tz=TZ)
+    target_times = pd.date_range(origin, periods=96, freq="15min")
+    return (
+        pd.DataFrame(
+            {
+                "issue_time": origin,
+                "target_time": target_times,
+                "horizon_step": np.arange(1, 97),
+                "target": "pv_kw",
+                "model_name": "chronos2_pv_univariate",
+                "context_length": 672,
+                "postprocessing": FROZEN_PV_POSTPROCESSING,
+            }
+        ),
+        [origin],
+    )
+
+
+def test_frozen_pv_validation_rejects_duplicate_and_missing_horizons() -> None:
+    rows, origins = _valid_frozen_pv_rows()
+    kwargs = {
+        "expected_origins": origins,
+        "model_name": "chronos2_pv_univariate",
+        "context_length": 672,
+        "postprocessing": FROZEN_PV_POSTPROCESSING,
+    }
+    with pytest.raises(RuntimeError, match="duplicate forecast keys"):
+        validate_frozen_april_pv_rows(
+            pd.concat([rows, rows.iloc[[0]]], ignore_index=True), **kwargs
+        )
+    with pytest.raises(RuntimeError, match="horizons are incomplete"):
+        validate_frozen_april_pv_rows(rows.iloc[:-1], **kwargs)
+
+
+def test_frozen_pv_rejects_unknown_postprocessing(tmp_path: Path) -> None:
+    table_path = tmp_path / "processed.parquet"
+    selection_path = tmp_path / "selection.json"
+    _processed_foshan_table().to_parquet(table_path, index=False)
+    _write_pv_selection(
+        selection_path,
+        "chronos2_pv_univariate",
+        postprocessing="unknown_policy",
+    )
+
+    with pytest.raises(ValueError, match="unknown postprocessing"):
+        generate_frozen_april_pv(
+            FakePvChronos(),
+            table_path,
+            DEFAULT_PV_CONFIG,
+            selection_path,
+            "fake-chronos-2",
+            max_origins=1,
+        )
+
+
+def test_frozen_pv_default_selection_path_is_corrected() -> None:
+    expected = Path("results/zero_shot/foshan_chronos2/selected_configuration.json")
+    assert DEFAULT_PV_SELECTION == expected
+    launcher = Path("scripts/run_foshan_residual_zero_shot.sh").read_text(
+        encoding="utf-8"
+    )
+    assert f"PV_SELECTION:-{expected.as_posix()}" in launcher
 
 
 def _write_tariff_csv(

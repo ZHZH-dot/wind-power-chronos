@@ -39,13 +39,17 @@ DEFAULT_DATA = Path(
 DEFAULT_PROCESSED_FOSHAN = Path(
     "results/zero_shot/foshan_chronos2/processed_foshan_15min.parquet"
 )
-DEFAULT_PV_SELECTION = Path("results/foshan_chronos2/selected_configuration.json")
+DEFAULT_PV_SELECTION = Path(
+    "results/zero_shot/foshan_chronos2/selected_configuration.json"
+)
 DEFAULT_PV_CONFIG = Path("configs/foshan_chronos2_zero_shot.json")
 MODEL_ID = "amazon/chronos-2"
 MODEL_REVISION = "29ec3766d36d6f73f0696f85560a422f50e8498c"
 REQUIRED_CHRONOS_VERSION = "2.3.1"
 PREDICTION_LENGTH = 96
 QUANTILES = (0.1, 0.5, 0.9)
+KNOWN_PV_POSTPROCESSING = frozenset({"raw", "physical_clip_0_1700"})
+FROZEN_PV_POSTPROCESSING = "physical_clip_0_1700"
 PREDICTION_COLUMNS = [
     "split",
     "candidate",
@@ -560,6 +564,19 @@ def generate_frozen_april_pv(
     pv_config = json.loads(pv_config_path.read_text(encoding="utf-8"))
     selection = json.loads(pv_selection_path.read_text(encoding="utf-8"))
     selected = selection["targets"]["pv_kw"]
+    selected_postprocessing = selected.get(
+        "postprocessing", pv_config.get("selection", {}).get("postprocessing")
+    )
+    if selected_postprocessing not in KNOWN_PV_POSTPROCESSING:
+        raise ValueError(
+            "Frozen PV selection has an unknown postprocessing policy: "
+            f"{selected_postprocessing!r}."
+        )
+    if selected_postprocessing != FROZEN_PV_POSTPROCESSING:
+        raise ValueError(
+            "The frozen Foshan PV benchmark requires postprocessing="
+            f"{FROZEN_PV_POSTPROCESSING!r}; found {selected_postprocessing!r}."
+        )
     configuration = next(
         item
         for item in pv_config["configurations"]
@@ -581,16 +598,96 @@ def generate_frozen_april_pv(
         model_source,
         max_origins=max_origins,
     )
-    rows = rows.loc[rows["target"].eq("pv_kw")].copy()
     if skipped:
         raise RuntimeError(f"Frozen April PV forecast skipped origins: {skipped}")
-    expected = (max_origins if max_origins is not None else len(origins)) * PREDICTION_LENGTH
-    if len(rows) != expected:
-        raise RuntimeError(f"Frozen April PV forecast returned {len(rows)} rows, expected {expected}.")
+    selected_origins = origins[:max_origins] if max_origins is not None else origins
+    rows = rows.loc[
+        rows["target"].eq("pv_kw")
+        & rows["model_name"].eq(str(selected["model_name"]))
+        & pd.to_numeric(rows["context_length"], errors="coerce").eq(context_length)
+        & rows["postprocessing"].eq(selected_postprocessing)
+    ].copy()
+    validate_frozen_april_pv_rows(
+        rows,
+        expected_origins=selected_origins,
+        model_name=str(selected["model_name"]),
+        context_length=context_length,
+        postprocessing=selected_postprocessing,
+        frequency=str(pv_config["frequency"]),
+    )
     rows["model_revision"] = MODEL_REVISION
     rows["checkpoint_path"] = model_source
     rows["selection_was_frozen_before_residual_experiment"] = True
     return rows
+
+
+def validate_frozen_april_pv_rows(
+    rows: pd.DataFrame,
+    *,
+    expected_origins: Sequence[pd.Timestamp],
+    model_name: str,
+    context_length: int,
+    postprocessing: str,
+    frequency: str = FREQUENCY,
+) -> None:
+    """Validate the single-variant PV artifact consumed by controller evaluation."""
+    required = {
+        "issue_time",
+        "target_time",
+        "horizon_step",
+        "target",
+        "model_name",
+        "context_length",
+        "postprocessing",
+    }
+    missing = sorted(required - set(rows.columns))
+    if missing:
+        raise RuntimeError(f"Frozen April PV rows are missing columns: {missing}")
+    expected = [_site_aware(pd.DatetimeIndex([origin]))[0] for origin in expected_origins]
+    actual = list(_site_aware(rows["issue_time"].drop_duplicates()))
+    if set(actual) != set(expected) or len(actual) != len(expected):
+        raise RuntimeError(
+            "Frozen April PV origins differ from the expected set: "
+            f"missing={sorted(set(expected) - set(actual))}, "
+            f"additional={sorted(set(actual) - set(expected))}."
+        )
+    if not rows["target"].eq("pv_kw").all():
+        raise RuntimeError("Frozen April PV artifact contains a non-PV target.")
+    if not rows["model_name"].eq(model_name).all():
+        raise RuntimeError("Frozen April PV artifact contains another model name.")
+    if not pd.to_numeric(rows["context_length"], errors="coerce").eq(context_length).all():
+        raise RuntimeError("Frozen April PV artifact contains another context length.")
+    if postprocessing != FROZEN_PV_POSTPROCESSING or not rows["postprocessing"].eq(
+        FROZEN_PV_POSTPROCESSING
+    ).all():
+        raise RuntimeError(
+            "Frozen April PV artifact must contain only physical_clip_0_1700 rows."
+        )
+    key = ["issue_time", "target_time", "horizon_step"]
+    if rows.duplicated(key).any():
+        raise RuntimeError("Frozen April PV artifact contains duplicate forecast keys.")
+    for origin in expected:
+        issue_times = _site_aware(rows["issue_time"])
+        group = rows.loc[issue_times == origin].copy()
+        horizons = sorted(pd.to_numeric(group["horizon_step"], errors="raise").astype(int))
+        if horizons != list(range(1, PREDICTION_LENGTH + 1)):
+            raise RuntimeError(
+                f"Frozen April PV horizons are incomplete or duplicated at {origin}."
+            )
+        ordered = group.sort_values("horizon_step")
+        actual_times = _site_aware(ordered["target_time"])
+        expected_times = pd.date_range(
+            origin, periods=PREDICTION_LENGTH, freq=frequency
+        )
+        if not actual_times.equals(expected_times):
+            raise RuntimeError(
+                f"Frozen April PV target grid differs from the expected grid at {origin}."
+            )
+    expected_rows = len(expected) * PREDICTION_LENGTH
+    if len(rows) != expected_rows:
+        raise RuntimeError(
+            f"Frozen April PV forecast returned {len(rows)} rows, expected {expected_rows}."
+        )
 
 
 def update_peak_gpu(identity: dict[str, Any]) -> None:

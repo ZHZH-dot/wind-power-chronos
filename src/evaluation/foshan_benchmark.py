@@ -757,6 +757,7 @@ def select_may_configurations(metrics: pd.DataFrame) -> dict[str, Any]:
         selected["targets"][target] = {
             "model_name": str(winner["model_name"]),
             "context_length": int(winner["context_length"]),
+            "postprocessing": str(winner["postprocessing"]),
             "selection_wape": float(winner["wape"]),
             "selection_tie_break": float(
                 winner["pv_active_mae"] if target == "pv_kw" else winner["mae"]

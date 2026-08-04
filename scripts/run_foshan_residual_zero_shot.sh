@@ -52,7 +52,7 @@ python -m src.models.foshan_residual_zero_shot \
   --config "${CONFIG}" \
   --input "${OUTPUT_ROOT}/data/signed_residual_15min.parquet" \
   --processed-foshan-input "${PROCESSED_FOSHAN_INPUT:-results/zero_shot/foshan_chronos2/processed_foshan_15min.parquet}" \
-  --pv-selection "${PV_SELECTION:-results/foshan_chronos2/selected_configuration.json}" \
+  --pv-selection "${PV_SELECTION:-results/zero_shot/foshan_chronos2/selected_configuration.json}" \
   --model-path "${SNAPSHOT}" \
   --output-dir "${OUTPUT_ROOT}/forecast" \
   --stage forecast \
