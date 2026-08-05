@@ -69,12 +69,15 @@
     }
   ],
   "lora_search": {
-    "ranks": [8, 16],
-    "alphas": [16, 32],
+    "rank_alpha_pairs": [
+      {"rank": 8, "alpha": 16},
+      {"rank": 16, "alpha": 32}
+    ],
     "learning_rates": [5e-5, 1e-4],
     "steps": [100, 300],
     "batch_size": 8,
-    "smoke_steps": 5
+    "smoke_steps": 5,
+    "smoke_batch_size": 1
   },
   "full_search": {
     "learning_rates": [5e-6, 1e-5],

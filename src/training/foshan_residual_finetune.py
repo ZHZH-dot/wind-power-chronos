@@ -11,6 +11,8 @@ import json
 import os
 import sys
 import time
+import traceback
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -41,6 +43,9 @@ from src.models.foshan_residual_zero_shot import (
 )
 from src.training.chronos_finetune import build_chronos2_hyperparameters
 from src.utils.runtime import git_commit, git_is_dirty
+
+
+MIN_GPU_VRAM_GIB = 23.0
 
 
 @dataclass(frozen=True)
@@ -154,22 +159,29 @@ def training_candidates(
 ) -> list[dict[str, Any]]:
     if fine_tune_mode == "lora":
         search = config["lora_search"]
+        pairs = [
+            (int(pair["rank"]), int(pair["alpha"]))
+            for pair in search["rank_alpha_pairs"]
+        ]
+        if pairs != [(8, 16), (16, 32)]:
+            raise ValueError(
+                "Residual LoRA rank/alpha pairs must be exactly (8, 16) and (16, 32)."
+            )
         if smoke:
             return [
                 {
                     "name": "residual_lora_smoke_5s",
-                    "rank": int(search["ranks"][0]),
-                    "lora_alpha": int(search["alphas"][0]),
+                    "rank": pairs[0][0],
+                    "lora_alpha": pairs[0][1],
                     "learning_rate": float(search["learning_rates"][0]),
                     "steps": int(search["smoke_steps"]),
-                    "batch_size": int(search["batch_size"]),
+                    "batch_size": int(search["smoke_batch_size"]),
                     "seed": int(config["seed"]),
                 }
             ]
         candidates = []
-        for rank, alpha, learning_rate, steps in itertools.product(
-            search["ranks"],
-            search["alphas"],
+        for (rank, alpha), learning_rate, steps in itertools.product(
+            pairs,
             search["learning_rates"],
             search["steps"],
         ):
@@ -250,27 +262,40 @@ def build_residual_hyperparameters(
     return hyperparameters
 
 
-def gpu_preflight_4090() -> dict[str, Any]:
-    import torch
+def gpu_preflight(
+    torch_module: Any | None = None,
+    environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Require one explicit BF16-capable CUDA GPU without locking a model name."""
+    if torch_module is None:
+        import torch as torch_module
 
-    if os.environ.get("CUDA_VISIBLE_DEVICES") != "0":
+    env = os.environ if environment is None else environment
+    if env.get("CUDA_VISIBLE_DEVICES") != "0":
         raise RuntimeError("Set CUDA_VISIBLE_DEVICES=0 for residual fine-tuning.")
-    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+    if not torch_module.cuda.is_available() or torch_module.cuda.device_count() != 1:
         raise RuntimeError("Residual fine-tuning requires exactly one visible CUDA GPU.")
-    name = torch.cuda.get_device_name(0)
-    if "RTX 4090" not in name:
-        raise RuntimeError(f"Residual fine-tuning requires RTX 4090; detected {name}.")
-    if not torch.cuda.is_bf16_supported():
-        raise RuntimeError("The RTX 4090 runtime must support BF16.")
+    name = str(torch_module.cuda.get_device_name(0))
+    if not torch_module.cuda.is_bf16_supported():
+        raise RuntimeError(f"The visible CUDA GPU must support BF16; detected {name}.")
+    total_memory = int(torch_module.cuda.get_device_properties(0).total_memory)
+    if total_memory < int(MIN_GPU_VRAM_GIB * 1024**3):
+        raise RuntimeError(
+            f"Residual fine-tuning requires at least {MIN_GPU_VRAM_GIB:.0f} GiB VRAM; "
+            f"detected {total_memory / 1024**3:.2f} GiB on {name}."
+        )
     return {
         "gpu_name": name,
-        "gpu_total_vram_bytes": int(torch.cuda.get_device_properties(0).total_memory),
+        "gpu_total_vram_bytes": total_memory,
         "bf16_supported": True,
         "dtype": "bfloat16",
-        "torch_version": torch.__version__,
-        "cuda_version": torch.version.cuda,
+        "torch_version": str(torch_module.__version__),
+        "cuda_version": str(torch_module.version.cuda),
+        "chronos_forecasting_version": package_version("chronos-forecasting"),
+        "autogluon_timeseries_version": package_version("autogluon.timeseries"),
+        "peft_version": package_version("peft"),
+        "accelerate_version": package_version("accelerate"),
     }
-
 
 def _load_autogluon() -> tuple[Any, Any]:
     from autogluon.timeseries import TimeSeriesDataFrame, TimeSeriesPredictor
@@ -305,8 +330,11 @@ def find_fine_tuned_checkpoint(
     weights = sorted(checkpoint.rglob("*.safetensors")) + sorted(
         checkpoint.rglob("pytorch_model*.bin")
     )
-    if fine_tune_mode == "lora" and not adapters:
-        raise RuntimeError("LoRA checkpoint contains no adapter_model.safetensors.")
+    if fine_tune_mode == "lora" and len(adapters) != 1:
+        raise RuntimeError(
+            "LoRA checkpoint must contain exactly one adapter_model.safetensors; "
+            f"found {adapters}."
+        )
     if fine_tune_mode == "full" and (adapters or not weights):
         raise RuntimeError("Full checkpoint must contain full weights and no LoRA adapter.")
     return checkpoint, weights
@@ -370,6 +398,7 @@ def verify_loaded_predictor(
         del core, pipeline
         gc.collect()
     checkpoint, weight_files = find_fine_tuned_checkpoint(predictor_path, fine_tune_mode)
+    adapter_files = sorted(checkpoint.rglob("adapter_model.safetensors"))
     return {
         **counts,
         "checkpoint_path": str(checkpoint.resolve()),
@@ -378,6 +407,15 @@ def verify_loaded_predictor(
             value.stat().st_size for value in checkpoint.rglob("*") if value.is_file()
         ),
         "checkpoint_weight_files": [str(value.resolve()) for value in weight_files],
+        "adapter_model_path": (
+            str(adapter_files[0].resolve()) if adapter_files else None
+        ),
+        "adapter_model_sha256": (
+            sha256_file(adapter_files[0]) if adapter_files else None
+        ),
+        "adapter_model_size_bytes": (
+            int(adapter_files[0].stat().st_size) if adapter_files else None
+        ),
         "base_model_source_verified": str(snapshot.resolve()),
         "fine_tune_mode_verified": fine_tune_mode,
     }
@@ -461,7 +499,7 @@ def fit_residual_candidate(
         ),
         "trained_model_name": trained[0],
         "predictor_path": str(predictor_path.resolve()),
-        "hyperparameters": hyperparameters,
+        "autogluon_hyperparameters": hyperparameters,
         **inspection,
     }
     return reloaded, dataframe_class, trained[0], stats
@@ -569,6 +607,22 @@ def predict_saved_period(
     predictions = pd.concat(frames, ignore_index=True)
     if predictions.groupby("inference_call_id")["issue_time"].nunique().gt(1).any():
         raise AssertionError("A trained Chronos inference call batched issue times.")
+    if predictions.groupby("inference_call_id").size().ne(PREDICTION_LENGTH).any():
+        raise AssertionError("Every trained Chronos call must contain exactly 96 horizons.")
+    expected_horizons = list(range(1, PREDICTION_LENGTH + 1))
+    for _, group in predictions.groupby("inference_call_id", sort=False):
+        if sorted(group["horizon_step"].astype(int).tolist()) != expected_horizons:
+            raise AssertionError("A trained Chronos call has missing or duplicate horizons.")
+    if not (
+        pd.to_datetime(predictions["context_end"], utc=True)
+        < pd.to_datetime(predictions["issue_time"], utc=True)
+    ).all():
+        raise AssertionError("A trained Chronos context does not end before issue_time.")
+    expected_covariates = "|".join(CALENDAR_COLUMNS)
+    if not predictions["known_future_covariates"].eq(expected_covariates).all():
+        raise AssertionError("Trained inference used an unexpected known-future covariate set.")
+    if predictions["used_future_realized_data"].astype(bool).any():
+        raise AssertionError("Trained inference used future realized site data.")
     return predictions, pd.DataFrame(audits)
 
 
@@ -600,9 +654,20 @@ def _manifest_base(
         "validation_period": {
             "start": frames.selection_start.isoformat(),
             "end_exclusive": frames.selection_end_exclusive.isoformat(),
-            "used_for_model_selection_only": True,
+            "passed_as_autogluon_tuning_data": True,
+            "updates_model_weights": False,
         },
+        "autogluon_internal_validation_metric": "WQL",
+        "autogluon_internal_checkpoint_selection": (
+            "AutoGluon receives cumulative March-April tuning_data and may use WQL "
+            "for validation, early stopping, and internal checkpoint selection."
+        ),
+        "outer_candidate_selection": (
+            "April equal-SOC controller revenue descending, then residual WAPE and "
+            "absolute bias ascending."
+        ),
         "may_targets_passed_to_fit_or_selection": False,
+        "may_used_for_selection": False,
         "input_path": str(input_path.resolve()),
         "input_sha256": sha256_file(input_path),
         "config_path": str(config_path.resolve()),
@@ -614,17 +679,150 @@ def _manifest_base(
         "git_dirty": git_is_dirty(),
         "runtime_environment": preflight,
         "april_selection_results": None,
+        "may_inference_completed": False,
+        "may_evaluation_count": 0,
     }
 
 
+def _manifest_compatibility_errors(
+    manifest: dict[str, Any],
+    *,
+    input_sha256: str,
+    config_sha256: str,
+    snapshot: Path,
+    fine_tune_mode: str,
+    candidate: dict[str, Any],
+) -> list[str]:
+    expected = {
+        "input_sha256": input_sha256,
+        "config_sha256": config_sha256,
+        "base_model_revision": MODEL_REVISION,
+        "base_model_snapshot": str(snapshot.resolve()),
+        "fine_tune_mode": fine_tune_mode,
+        "hyperparameters": candidate,
+    }
+    return [
+        key
+        for key, value in expected.items()
+        if manifest.get(key) != value
+    ]
+
+
+def _validate_completed_candidate(candidate_dir: Path, manifest: dict[str, Any]) -> None:
+    required_files = [
+        candidate_dir / "candidate_config.json",
+        candidate_dir / "april_predictions.csv",
+        candidate_dir / "april_inference_audit.csv",
+    ]
+    missing = [str(path) for path in required_files if not path.is_file()]
+    predictor_path = Path(str(manifest.get("predictor_path", "")))
+    if not predictor_path.is_dir():
+        missing.append(str(predictor_path))
+    if missing:
+        raise RuntimeError(
+            f"Completed candidate has missing artifacts in {candidate_dir}: {missing}"
+        )
+    checkpoint, _ = find_fine_tuned_checkpoint(
+        predictor_path, str(manifest["fine_tune_mode"])
+    )
+    if str(checkpoint.resolve()) != str(manifest.get("checkpoint_path")):
+        raise RuntimeError(
+            f"Completed candidate checkpoint path changed in {candidate_dir}."
+        )
+    if _directory_sha256(checkpoint) != manifest.get("checkpoint_sha256"):
+        raise RuntimeError(
+            f"Completed candidate checkpoint hash changed in {candidate_dir}."
+        )
+
+
+def resolve_candidate_attempt(
+    output_dir: Path,
+    candidate: dict[str, Any],
+    *,
+    input_sha256: str,
+    config_sha256: str,
+    snapshot: Path,
+    fine_tune_mode: str,
+    resume: bool,
+) -> tuple[Path, bool]:
+    """Return a fresh attempt or one hash-compatible completed candidate."""
+    base = output_dir / str(candidate["name"])
+    attempts = [base, *sorted(output_dir.glob(f"{base.name}__attempt_*"))]
+    existing = [path for path in attempts if path.exists()]
+    if not existing:
+        return base, False
+    if not resume:
+        raise FileExistsError(f"Candidate output already exists: {existing[0]}")
+    for path in existing:
+        manifest_path = path / "training_manifest.json"
+        if not manifest_path.is_file():
+            raise RuntimeError(
+                f"Cannot resume incompatible partial candidate without manifest: {path}"
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        errors = _manifest_compatibility_errors(
+            manifest,
+            input_sha256=input_sha256,
+            config_sha256=config_sha256,
+            snapshot=snapshot,
+            fine_tune_mode=fine_tune_mode,
+            candidate=candidate,
+        )
+        if errors:
+            raise RuntimeError(
+                f"Cannot resume incompatible candidate {path}; mismatched fields: {errors}"
+            )
+        if manifest.get("status") == "trained_checkpoint_reloaded":
+            _validate_completed_candidate(path, manifest)
+            return path, True
+        if manifest.get("status") != "failed":
+            raise RuntimeError(
+                f"Cannot resume partial candidate {path} with status "
+                f"{manifest.get('status')!r}."
+            )
+    attempt_number = 1
+    while (output_dir / f"{base.name}__attempt_{attempt_number:02d}").exists():
+        attempt_number += 1
+    return output_dir / f"{base.name}__attempt_{attempt_number:02d}", False
+
+
+def validate_may_prediction_gate(
+    manifest: dict[str, Any],
+    candidate_dir: Path,
+) -> None:
+    if manifest.get("status") != "trained_checkpoint_reloaded":
+        raise RuntimeError("Selected candidate has no verified trained checkpoint.")
+    selection = manifest.get("april_selection_results")
+    if not isinstance(selection, dict):
+        raise RuntimeError("May prediction requires completed April controller evaluation.")
+    if selection.get("physical_requirements_satisfied") is not True:
+        raise RuntimeError("May prediction requires a physically valid April controller result.")
+    if selection.get("selected_within_mode") is not True:
+        raise RuntimeError("May prediction requires selected_within_mode=true.")
+    if selection.get("may_used_for_selection") is not False:
+        raise RuntimeError("May data must not participate in candidate selection.")
+    if manifest.get("may_inference_completed") is True or int(
+        manifest.get("may_evaluation_count", 0)
+    ) != 0:
+        raise RuntimeError("The selected candidate has already been evaluated on May.")
+    if (candidate_dir / "may_predictions.csv").exists() or (
+        candidate_dir / "may_inference_audit.csv"
+    ).exists():
+        raise RuntimeError("May prediction artifacts already exist for this candidate.")
+
+
 def run_training(args: argparse.Namespace) -> Path:
+    if getattr(args, "allow_download", False):
+        raise ValueError(
+            "Residual fine-tuning is offline-only; --allow-download is not permitted."
+        )
     config = load_residual_config(args.config)
     residual = pd.read_parquet(args.input)
     frames = prepare_residual_training_frames(residual, config)
     snapshot = resolve_pinned_snapshot(
         model_path=args.model_path,
         hf_home=args.hf_home,
-        allow_download=args.allow_download,
+        allow_download=False,
     )
     candidates = training_candidates(
         config,
@@ -633,6 +831,19 @@ def run_training(args: argparse.Namespace) -> Path:
     )
     if args.max_candidates is not None:
         candidates = candidates[: args.max_candidates]
+    batch_size_override = getattr(args, "batch_size_override", None)
+    if batch_size_override is not None:
+        if batch_size_override <= 0:
+            raise ValueError("--batch-size-override must be positive.")
+        candidates = [
+            {
+                **candidate,
+                "name": f"{candidate['name']}_b{batch_size_override}",
+                "batch_size": int(batch_size_override),
+                "batch_size_was_explicitly_overridden": True,
+            }
+            for candidate in candidates
+        ]
     dry_summary = {
         "status": "dry_run_validated",
         "fine_tune_mode": args.fine_tune_mode,
@@ -642,7 +853,14 @@ def run_training(args: argparse.Namespace) -> Path:
         "tuning_rows": len(frames.tuning),
         "train_max_timestamp": frames.train["timestamp"].max(),
         "tuning_max_timestamp": frames.tuning["timestamp"].max(),
+        "train_end_exclusive": frames.train_end_exclusive,
+        "selection_end_exclusive": frames.selection_end_exclusive,
+        "target": TARGET_COLUMN,
+        "known_future_covariates": list(CALENDAR_COLUMNS),
+        "autogluon_validation_metric": "WQL",
+        "april_updates_model_weights": False,
         "may_targets_passed_to_fit_or_selection": False,
+        "may_used_for_selection": False,
         "snapshot": str(snapshot.resolve()),
     }
     if args.stage == "dry-run":
@@ -651,24 +869,64 @@ def run_training(args: argparse.Namespace) -> Path:
         print(json.dumps(dry_summary, indent=2, default=str))
         return args.output_dir
 
-    preflight = gpu_preflight_4090()
-    args.output_dir.mkdir(parents=True, exist_ok=False)
-    dataframe_class, predictor_class = _load_autogluon()
+    preflight = gpu_preflight()
+    resume = bool(getattr(args, "resume", False))
+    if args.output_dir.exists() and not resume:
+        raise FileExistsError(f"Refusing to overwrite output directory: {args.output_dir}")
+    args.output_dir.mkdir(parents=True, exist_ok=resume)
+    _load_autogluon()
+    input_sha256 = sha256_file(args.input)
+    config_sha256 = sha256_file(args.config)
+    completed: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
     for candidate in candidates:
-        candidate_dir = args.output_dir / str(candidate["name"])
-        candidate_dir.mkdir(parents=True, exist_ok=False)
-        manifest = _manifest_base(
-            args.config,
-            args.input,
-            snapshot,
+        candidate_dir, reused = resolve_candidate_attempt(
+            args.output_dir,
             candidate,
-            args.fine_tune_mode,
-            frames,
-            preflight,
+            input_sha256=input_sha256,
+            config_sha256=config_sha256,
+            snapshot=snapshot,
+            fine_tune_mode=args.fine_tune_mode,
+            resume=resume,
         )
+        if reused:
+            completed.append(
+                {
+                    "candidate": candidate["name"],
+                    "candidate_dir": str(candidate_dir.resolve()),
+                    "reused": True,
+                }
+            )
+            print(f"RESUME_REUSED: {candidate_dir}", flush=True)
+            continue
+        candidate_dir.mkdir(parents=True, exist_ok=False)
+        manifest = {
+            "status": "configured",
+            "candidate_name": candidate["name"],
+            "hyperparameters": candidate,
+            "fine_tune_mode": args.fine_tune_mode,
+            "base_model_revision": MODEL_REVISION,
+            "base_model_snapshot": str(snapshot.resolve()),
+            "input_sha256": input_sha256,
+            "config_sha256": config_sha256,
+            "stage": args.stage,
+            "attempt_directory": str(candidate_dir.resolve()),
+            "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
         _write_json(candidate_dir / "candidate_config.json", candidate)
         try:
-            predictor, _, model_name, stats = fit_residual_candidate(
+            manifest.update(
+                _manifest_base(
+                    args.config,
+                    args.input,
+                    snapshot,
+                    candidate,
+                    args.fine_tune_mode,
+                    frames,
+                    preflight,
+                )
+            )
+            predictor, candidate_dataframe_class, model_name, stats = fit_residual_candidate(
                 frames,
                 config,
                 candidate,
@@ -685,7 +943,7 @@ def run_training(args: argparse.Namespace) -> Path:
             max_issues = 1 if args.stage == "smoke" else None
             predictions, inference_audit = predict_saved_period(
                 predictor,
-                dataframe_class,
+                candidate_dataframe_class,
                 model_name,
                 residual,
                 april_issues,
@@ -709,21 +967,80 @@ def run_training(args: argparse.Namespace) -> Path:
                     "status": "trained_checkpoint_reloaded",
                     "trained_model_name": model_name,
                     "april_issue_count": int(predictions["issue_time"].nunique()),
+                    "april_inference_runtime_seconds": float(
+                        inference_audit["runtime_seconds"].sum()
+                    ),
+                    "april_horizons_verified": list(range(1, PREDICTION_LENGTH + 1)),
+                    "april_context_strictly_before_issue_time": True,
+                    "known_future_covariates_verified": list(CALENDAR_COLUMNS),
+                    "completed_at_utc": datetime.now(timezone.utc).isoformat(),
                     "may_inference_completed": False,
+                    "may_evaluation_count": 0,
                     **stats,
                 }
             )
+            try:
+                import torch
+
+                manifest["peak_allocated_gpu_bytes"] = max(
+                    int(manifest.get("peak_allocated_gpu_bytes") or 0),
+                    int(torch.cuda.max_memory_allocated(0)),
+                )
+                manifest["peak_reserved_gpu_bytes"] = max(
+                    int(manifest.get("peak_reserved_gpu_bytes") or 0),
+                    int(torch.cuda.max_memory_reserved(0)),
+                )
+            except (ImportError, RuntimeError):
+                pass
         except Exception as error:
             manifest.update(
                 {
                     "status": "failed",
                     "error_type": type(error).__name__,
                     "error": str(error),
+                    "traceback": traceback.format_exc(),
+                    "failed_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "oom_failure": "out of memory" in str(error).lower(),
+                    "automatic_batch_size_retry": False,
                 }
             )
             _write_json(candidate_dir / "training_manifest.json", manifest)
-            raise
+            failures.append(
+                {
+                    "candidate": candidate["name"],
+                    "candidate_dir": str(candidate_dir.resolve()),
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+            print(
+                f"CANDIDATE_FAILED: {candidate['name']}: {type(error).__name__}: {error}",
+                flush=True,
+            )
+            continue
         _write_json(candidate_dir / "training_manifest.json", manifest)
+        completed.append(
+            {
+                "candidate": candidate["name"],
+                "candidate_dir": str(candidate_dir.resolve()),
+                "reused": False,
+            }
+        )
+        print(f"CANDIDATE_COMPLETED: {candidate_dir}", flush=True)
+    summary = {
+        **dry_summary,
+        "status": "completed" if completed else "failed",
+        "completed_candidate_count": len(completed),
+        "failed_candidate_count": len(failures),
+        "completed_candidates": completed,
+        "failed_candidates": failures,
+        "resume": resume,
+    }
+    _write_json(args.output_dir / "run_summary.json", summary)
+    if not completed:
+        raise RuntimeError(
+            f"All {len(candidates)} residual {args.fine_tune_mode} candidates failed."
+        )
     return args.output_dir
 
 
@@ -731,30 +1048,49 @@ def run_selected_may_inference(args: argparse.Namespace) -> Path:
     if args.candidate_dir is None:
         raise ValueError("--candidate-dir is required for --stage may-predict.")
     config = load_residual_config(args.config)
+    if getattr(args, "allow_download", False):
+        raise ValueError(
+            "Residual fine-tuning is offline-only; --allow-download is not permitted."
+        )
     snapshot = resolve_pinned_snapshot(
         model_path=args.model_path,
         hf_home=args.hf_home,
-        allow_download=args.allow_download,
+        allow_download=False,
     )
-    gpu_preflight_4090()
+    gpu_preflight()
     manifest_path = args.candidate_dir / "training_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("status") != "trained_checkpoint_reloaded":
-        raise RuntimeError("Selected candidate has no verified trained checkpoint.")
     if manifest.get("base_model_revision") != MODEL_REVISION:
         raise RuntimeError("Selected candidate uses a different base revision.")
-    if (args.candidate_dir / "may_predictions.csv").exists():
-        raise FileExistsError("Refusing to overwrite existing May predictions.")
+    if manifest.get("input_sha256") != sha256_file(args.input):
+        raise RuntimeError("Selected candidate input hash does not match --input.")
+    if manifest.get("config_sha256") != sha256_file(args.config):
+        raise RuntimeError("Selected candidate config hash does not match --config.")
+    if manifest.get("base_model_snapshot") != str(snapshot.resolve()):
+        raise RuntimeError("Selected candidate uses a different pinned snapshot path.")
+    if manifest.get("fine_tune_mode") != args.fine_tune_mode:
+        raise RuntimeError("Selected candidate mode does not match --fine-tune-mode.")
+    validate_may_prediction_gate(manifest, args.candidate_dir)
     dataframe_class, predictor_class = _load_autogluon()
     predictor_path = Path(manifest["predictor_path"])
     predictor = predictor_class.load(str(predictor_path))
-    verify_loaded_predictor(
+    inspection = verify_loaded_predictor(
         predictor,
         predictor_path,
         str(manifest["trained_model_name"]),
         str(manifest["fine_tune_mode"]),
         snapshot,
     )
+    for field in (
+        "checkpoint_path",
+        "checkpoint_sha256",
+        "adapter_model_sha256",
+    ):
+        if inspection.get(field) != manifest.get(field):
+            raise RuntimeError(
+                f"Selected candidate {field} changed after training: "
+                f"{inspection.get(field)!r} != {manifest.get(field)!r}."
+            )
     residual = pd.read_parquet(args.input)
     issues = forecast_issue_times(
         config["test_period"]["start"],
@@ -780,7 +1116,10 @@ def run_selected_may_inference(args: argparse.Namespace) -> Path:
         args.candidate_dir / "may_inference_audit.csv", index=False, float_format="%.15g"
     )
     manifest["may_inference_completed"] = True
+    manifest["may_evaluation_count"] = 1
+    manifest["may_inference_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
     manifest["may_issue_count"] = int(predictions["issue_time"].nunique())
+    manifest["may_inference_runtime_seconds"] = float(audit["runtime_seconds"].sum())
     _write_json(manifest_path, manifest)
     return args.candidate_dir
 
@@ -802,6 +1141,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--dataloader-num-workers", default=0, type=int)
     parser.add_argument("--max-candidates", default=None, type=int)
+    parser.add_argument("--batch-size-override", default=None, type=int)
+    parser.add_argument("--resume", action="store_true")
     return parser
 
 

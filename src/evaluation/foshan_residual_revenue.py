@@ -22,6 +22,7 @@ from src.data.reconstruct_foshan_residual import (
     TARGET_LABEL,
     aggregate_signed_residual_15min,
     reconstruct_signed_residual,
+    sha256_file,
 )
 from src.models.foshan_residual_zero_shot import (
     MODEL_ID,
@@ -61,6 +62,100 @@ def _write_json(path: Path, value: Any) -> None:
         json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n",
         encoding="utf-8",
     )
+
+
+def _file_identity(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Required revenue input does not exist: {path}")
+    return {
+        "path": str(path.resolve()),
+        "sha256": sha256_file(path),
+    }
+
+
+def build_revenue_run_identity(args: argparse.Namespace) -> dict[str, Any]:
+    """Return the immutable inputs that make a revenue run resumable."""
+    files = {
+        name: _file_identity(Path(getattr(args, name)))
+        for name in (
+            "site_workbook",
+            "storage_workbook",
+            "dispatch_input",
+            "residual_predictions",
+            "april_pv_predictions",
+            "may_pv_predictions",
+            "may_pv_selection",
+            "gross_load_predictions",
+            "residual_data",
+            "training_config",
+        )
+    }
+    trained_candidates: list[dict[str, Any]] = []
+    for run_dir_value in args.trained_run_dir:
+        run_dir = Path(run_dir_value)
+        manifest_path = run_dir / "training_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        trained_candidates.append(
+            {
+                "path": str(run_dir.resolve()),
+                "candidate_name": manifest.get("candidate_name"),
+                "fine_tune_mode": manifest.get("fine_tune_mode"),
+                "input_sha256": manifest.get("input_sha256"),
+                "config_sha256": manifest.get("config_sha256"),
+                "base_model_revision": manifest.get("base_model_revision"),
+                "checkpoint_sha256": manifest.get("checkpoint_sha256"),
+                "hyperparameters": manifest.get("hyperparameters"),
+                "april_predictions": _file_identity(
+                    run_dir / "april_predictions.csv"
+                ),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "model_revision": MODEL_REVISION,
+        "inputs": files,
+        "trained_candidates": trained_candidates,
+        "model_path": (
+            str(Path(args.model_path).expanduser().resolve())
+            if args.model_path is not None
+            else None
+        ),
+        "mip_relative_gap": float(args.mip_relative_gap),
+    }
+
+
+def prepare_revenue_output_dir(
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Create a new run or reopen only an input-compatible existing run."""
+    identity = build_revenue_run_identity(args)
+    manifest_path = output_dir / "run_manifest.json"
+    if output_dir.exists():
+        if not args.resume:
+            raise FileExistsError(f"Refusing to overwrite revenue output: {output_dir}")
+        if not manifest_path.is_file():
+            raise RuntimeError(
+                f"Cannot resume revenue output without run_manifest.json: {output_dir}"
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("run_identity") != identity:
+            raise RuntimeError(
+                f"Cannot resume revenue output with incompatible inputs: {output_dir}"
+            )
+        manifest["resume_count"] = int(manifest.get("resume_count", 0)) + 1
+        manifest["last_resumed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        manifest["status"] = "running"
+    else:
+        output_dir.mkdir(parents=True, exist_ok=False)
+        manifest = {
+            "status": "running",
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "resume_count": 0,
+            "run_identity": identity,
+        }
+    _write_json(manifest_path, manifest)
+    return manifest
 
 
 def _local_naive(values: pd.Series | pd.DatetimeIndex) -> pd.Series:
@@ -569,7 +664,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         output_dir = Path("results/revenue_ablation/foshan_residual_controller_v5") / datetime.now(
             timezone.utc
         ).strftime("%Y%m%dT%H%M%SZ")
-    output_dir.mkdir(parents=True, exist_ok=False)
+    run_manifest = prepare_revenue_output_dir(output_dir, args)
     frozen_hashes = verify_frozen_controller_sources()
     april_realized, may_realized, residual_target, data_audit = build_realized_inputs(
         args.site_workbook, args.storage_workbook, args.dispatch_input
@@ -798,6 +893,14 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         "provenance": {"git_commit": git_commit(), "git_dirty": git_is_dirty()},
     }
     _write_json(output_dir / "summary.json", summary)
+    run_manifest.update(
+        {
+            "status": "completed",
+            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "selections": selections,
+        }
+    )
+    _write_json(output_dir / "run_manifest.json", run_manifest)
     report = [
         "# Foshan signed residual forecast revenue benchmark",
         "",
@@ -824,12 +927,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--april-pv-predictions", required=True, type=Path)
     parser.add_argument(
         "--may-pv-predictions",
-        default=Path("results/foshan_chronos2/predictions_long.csv"),
+        default=Path("results/zero_shot/foshan_chronos2/predictions_long.csv"),
         type=Path,
     )
     parser.add_argument(
         "--may-pv-selection",
-        default=Path("results/foshan_chronos2/selected_configuration.json"),
+        default=Path(
+            "results/zero_shot/foshan_chronos2/selected_configuration.json"
+        ),
         type=Path,
     )
     parser.add_argument(

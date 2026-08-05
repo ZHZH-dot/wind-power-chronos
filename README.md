@@ -491,10 +491,18 @@ revision-specific snapshot directory. Every 00:00 and hourly issue is sent to
 Chronos in a separate `predict_df()` call; target context ends at `t-15min`,
 and future data contains only calendar and tariff indicators.
 
-April 2026 alone selects candidates by equal-SOC controller revenue, with
-signed-residual WAPE and absolute bias as tie-breakers. March is the only
-fine-tuning period. May is the final counterfactual economic test and never
-participates in model or hyperparameter selection.
+The older Foshan LoRA experiment trained PV-only and joint PV/net-grid models.
+Those adapters are historical artifacts and are not compatible with this
+signed-residual challenger. The residual route trains only
+`signed_residual_load_kw` from its processed Parquet input.
+
+The information boundaries are fixed: March 2026 is the only weight-updating
+period, cumulative March-April data is passed to AutoGluon as `tuning_data`,
+and May is excluded from fit and selection. AutoGluon evaluates its saved model
+with WQL and may use that validation signal for early stopping or internal
+checkpoint selection. The outer candidate winner is selected on April
+equal-SOC controller revenue descending, then residual WAPE and absolute bias
+ascending. Only that frozen winner may be inferred and evaluated on May, once.
 
 Prepare data, run a pinned one-origin smoke, and generate zero-shot candidates:
 
@@ -512,20 +520,44 @@ bash scripts/run_foshan_residual_zero_shot.sh \
   '/path/to/may_month_dispatch_timeseries.csv'
 ```
 
-The LoRA and full launchers require exactly one RTX 4090, BF16, and GPU 0. Each
-runs tests and a model-free dry run, then a five-step smoke before its bounded
-search. LoRA searches rank 8/16, alpha 16/32, learning rate `5e-5`/`1e-4`, and
-100/300 steps. Full tuning searches learning rate `5e-6`/`1e-5` and 50/100
-steps with batch 4 and gradient accumulation 4 (effective batch 16).
+Residual LoRA requires exactly one visible BF16-capable CUDA GPU selected with
+`CUDA_VISIBLE_DEVICES=0`; it is not locked to a particular GPU name. The exact
+revision-specific local snapshot must contain `config.json` and
+`model.safetensors`. The launcher is stage-gated: `dry-run`, `smoke`, and
+`search` are separate invocations, and a smoke invocation cannot begin the
+search. The complete grid has eight candidates: paired rank/alpha `(8, 16)` and
+`(16, 32)`, crossed with learning rate `5e-5`/`1e-4` and 100/300 steps, using
+batch size 8 and seed 42. The smoke is one April issue with rank 8, alpha 16,
+learning rate `5e-5`, five steps, and batch size 1.
 
 ```bash
-export RESIDUAL_DATA=results/residual_forecast/foshan_chronos2/residual_20260802/data/signed_residual_15min.parquet
+export CUDA_VISIBLE_DEVICES=0
+export HF_HOME=/data/GDUT_stu/.cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export CHRONOS_MODEL_PATH="$HF_HOME/hub/models--amazon--chronos-2/snapshots/29ec3766d36d6f73f0696f85560a422f50e8498c"
+export RESIDUAL_DATA=results/residual_forecast/foshan_chronos2/pv_selection_fix_20260804T003741Z/data/signed_residual_15min.parquet
 
-OUTPUT_DIR=results/fine_tune/foshan_chronos2_residual/lora_20260802 \
-bash scripts/run_foshan_residual_lora_4090.sh "$RESIDUAL_DATA"
+OUTPUT_DIR=results/fine_tune/foshan_chronos2_residual/lora_dry_run \
+bash scripts/run_foshan_residual_lora_4090.sh dry-run "$RESIDUAL_DATA"
 
-OUTPUT_DIR=results/fine_tune/foshan_chronos2_residual/full_20260802 \
-bash scripts/run_foshan_residual_full_4090.sh "$RESIDUAL_DATA"
+OUTPUT_DIR=results/fine_tune/foshan_chronos2_residual/lora_smoke \
+bash scripts/run_foshan_residual_lora_4090.sh smoke "$RESIDUAL_DATA"
+```
+
+Review `lora_smoke/run_summary.json`, the candidate `training_manifest.json`,
+the reloaded predictor, and `fine-tuned-ckpt/adapter_model.safetensors` before
+starting the complete search. Resume preserves failed attempts and reuses a
+completed candidate only when its input/config hashes, pinned revision, mode,
+and hyperparameters match. An OOM does not silently change batch size; retry
+explicitly in a new output directory with `BATCH_SIZE_OVERRIDE=<n>`.
+
+```bash
+OUTPUT_DIR=results/fine_tune/foshan_chronos2_residual/lora_search \
+bash scripts/run_foshan_residual_lora_4090.sh search "$RESIDUAL_DATA"
+
+RESUME=1 OUTPUT_DIR=results/fine_tune/foshan_chronos2_residual/lora_search \
+bash scripts/run_foshan_residual_lora_4090.sh search "$RESIDUAL_DATA"
 ```
 
 Run April revenue selection and one May evaluation for each frozen model-class
@@ -533,23 +565,23 @@ winner. `TRAINED_RUN_DIRS` is optional; omit it for the zero-shot-only run.
 
 ```bash
 export TRAINED_RUN_DIRS="$(printf '%s ' \
-  results/fine_tune/foshan_chronos2_residual/lora_20260802/search/residual_lora_* \
-  results/fine_tune/foshan_chronos2_residual/full_20260802/search/residual_full_*)"
-export RESIDUAL_DATA=results/residual_forecast/foshan_chronos2/residual_20260802/data/signed_residual_15min.parquet
-export OUTPUT_DIR=results/revenue_ablation/foshan_residual_controller_v5/revenue_20260802
+  results/fine_tune/foshan_chronos2_residual/lora_search/residual_lora_*)"
+export OUTPUT_DIR=results/revenue_ablation/foshan_residual_controller_v5/residual_lora
 
 bash scripts/run_foshan_residual_revenue_eval.sh \
   '/path/to/光伏与负荷数据_202603-06.xlsx' \
   '/path/to/储能数据20260707230737.xlsx' \
   '/path/to/may_month_dispatch_timeseries.csv' \
-  results/residual_forecast/foshan_chronos2/residual_20260802/forecast
+  results/residual_forecast/foshan_chronos2/pv_selection_fix_20260804T003741Z/forecast
 ```
 
-Generated directories are non-overwriting. Training manifests record the exact
-base revision, predictor/checkpoint paths and hashes, trainable/total parameter
-counts, runtime, peak VRAM, and April selection result. A trained candidate is
-excluded unless its saved AutoGluon predictor and fine-tuned checkpoint reload
-successfully without falling back to the base model.
+Generated directories are non-overwriting. Set `RESUME=1` only for the same
+revenue inputs; `run_manifest.json` hashes the immutable input set and rejects
+incompatible resume attempts. Training manifests record the exact base
+revision, predictor/checkpoint and adapter paths and hashes, trainable/frozen/
+total parameter counts, runtime, peak VRAM, all 96 horizons, and April selection
+result. A candidate is excluded unless its saved AutoGluon predictor and the
+single LoRA adapter checkpoint reload without falling back to the base model.
 
 ## Chronos-2 LoRA Fine-Tuning
 

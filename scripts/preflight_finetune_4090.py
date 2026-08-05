@@ -12,8 +12,6 @@ from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 
-MIN_CHRONOS_VERSION = Version("2.1.0")
-TARGET_GPU_NAME = "RTX 4090"
 MIN_VRAM_GIB = 23.0
 
 
@@ -54,6 +52,8 @@ def collect_preflight() -> tuple[dict[str, Any], list[str]]:
         "pytorch_cuda": torch.version.cuda,
         "autogluon.timeseries": autogluon_version,
         "chronos-forecasting": chronos_version,
+        "peft": installed_version("peft"),
+        "accelerate": installed_version("accelerate"),
         "CUDA_VISIBLE_DEVICES": visible_devices,
         "torch.cuda.is_available": cuda_available,
         "visible_gpu_count": gpu_count,
@@ -70,8 +70,8 @@ def collect_preflight() -> tuple[dict[str, Any], list[str]]:
         failures.append("autogluon.timeseries is not installed.")
     if chronos_version is None:
         failures.append("chronos-forecasting is not installed.")
-    elif Version(chronos_version) < MIN_CHRONOS_VERSION:
-        failures.append("chronos-forecasting 2.1.0 or newer is required for past covariates.")
+    elif Version(chronos_version) != Version("2.3.1"):
+        failures.append("The Foshan residual workflow requires chronos-forecasting==2.3.1.")
     if autogluon_version is not None and chronos_version is not None:
         requirement = autogluon_chronos_requirement()
         report["autogluon_chronos_requirement"] = str(requirement) if requirement else None
@@ -85,10 +85,10 @@ def collect_preflight() -> tuple[dict[str, Any], list[str]]:
         failures.append("PyTorch cannot access CUDA.")
     elif gpu_count != 1:
         failures.append(f"Expected one visible GPU, detected {gpu_count}.")
-    if gpu_name is None or TARGET_GPU_NAME not in gpu_name:
-        failures.append(f"Expected an {TARGET_GPU_NAME}, detected {gpu_name or 'no GPU'}.")
     if vram_gib is None or vram_gib < MIN_VRAM_GIB:
         failures.append(f"Expected at least {MIN_VRAM_GIB:.0f} GiB VRAM, detected {vram_gib}.")
+    if cuda_available and not bf16_supported:
+        failures.append(f"The visible CUDA GPU must support BF16; detected {gpu_name}.")
     return report, failures
 
 
