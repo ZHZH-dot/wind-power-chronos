@@ -343,20 +343,17 @@ def _peft_type_name(value: Any) -> str:
 
 
 def _loaded_adapter_tensor_stats(model: Any, adapter_names: list[str]) -> tuple[int, int]:
-    state_getter = getattr(model, "get_adapter_state_dict", None)
+    try:
+        from peft import get_peft_model_state_dict
+    except ImportError as error:
+        raise RuntimeError(
+            "PEFT does not expose an adapter state-dict API for reload verification."
+        ) from error
+
     tensor_count = 0
     parameter_count = 0
     for adapter_name in adapter_names:
-        if callable(state_getter):
-            state = state_getter(adapter_name=adapter_name)
-        else:
-            try:
-                from peft import get_peft_model_state_dict
-            except ImportError as error:
-                raise RuntimeError(
-                    "PEFT does not expose an adapter state-dict API for reload verification."
-                ) from error
-            state = get_peft_model_state_dict(model, adapter_name=adapter_name)
+        state = get_peft_model_state_dict(model, adapter_name=adapter_name)
         if not isinstance(state, dict) or not state:
             raise RuntimeError(
                 f"Active PEFT adapter {adapter_name!r} has no loaded tensors."

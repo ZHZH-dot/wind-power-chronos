@@ -4,9 +4,10 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from argparse import Namespace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -148,6 +149,12 @@ class FakePeftModel:
             FakeTensor(32, requires_grad=trainable),
             FakeTensor(32, requires_grad=trainable),
         ]
+        self.adapter_state = {
+            "default": {
+                "layer.lora_A.weight": FakeTensor(32),
+                "layer.lora_B.weight": FakeTensor(32),
+            }
+        }
 
     def parameters(self) -> list[FakeTensor]:
         return self._parameters
@@ -165,13 +172,18 @@ class FakePeftModel:
             total_params=total,
         )
 
-    def get_adapter_state_dict(self, *, adapter_name: str) -> dict[str, FakeTensor]:
-        if adapter_name != "default":
-            return {}
-        return {
-            "layer.lora_A.weight": FakeTensor(32),
-            "layer.lora_B.weight": FakeTensor(32),
-        }
+
+@pytest.fixture
+def fake_peft_state_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    peft_module = ModuleType("peft")
+
+    def get_peft_model_state_dict(
+        model: FakePeftModel, *, adapter_name: str
+    ) -> dict[str, FakeTensor]:
+        return model.adapter_state.get(adapter_name, {})
+
+    peft_module.get_peft_model_state_dict = get_peft_model_state_dict  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "peft", peft_module)
 
 
 class FakeBaseModel:
@@ -240,7 +252,9 @@ def _write_adapter_artifacts(
     (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
 
 
-def test_training_parameter_capture_records_real_lora_state() -> None:
+def test_training_parameter_capture_records_real_lora_state(
+    fake_peft_state_api: None,
+) -> None:
     class FakeChronosPipeline:
         def fit(self, **_kwargs: object) -> SimpleNamespace:
             return SimpleNamespace(model=FakePeftModel(trainable=True))
@@ -264,6 +278,7 @@ def test_training_parameter_capture_records_real_lora_state() -> None:
 
 def test_checkpoint_verification_separates_reload_state_and_rejects_base_fallback(
     tmp_path: Path,
+    fake_peft_state_api: None,
 ) -> None:
     snapshot = tmp_path / MODEL_REVISION
     snapshot.mkdir()
@@ -317,7 +332,10 @@ def test_checkpoint_verification_separates_reload_state_and_rejects_base_fallbac
         )
 
 
-def test_disabled_or_mismatched_lora_adapter_is_rejected(tmp_path: Path) -> None:
+def test_disabled_or_mismatched_lora_adapter_is_rejected(
+    tmp_path: Path,
+    fake_peft_state_api: None,
+) -> None:
     snapshot = tmp_path / MODEL_REVISION
     snapshot.mkdir()
     predictor_path = tmp_path / "predictor"
@@ -394,11 +412,60 @@ def test_lora_checkpoint_requires_complete_unique_nonempty_artifacts(tmp_path: P
         find_fine_tuned_checkpoint(predictor_path, "lora")
 
 
-def test_lora_model_state_requires_loaded_adapter_tensors() -> None:
+def test_lora_model_state_requires_loaded_adapter_tensors(
+    fake_peft_state_api: None,
+) -> None:
     model = FakePeftModel(trainable=False)
-    model.get_adapter_state_dict = lambda **_kwargs: {}
+    model.adapter_state["default"] = {}
     with pytest.raises(RuntimeError, match="no loaded tensors"):
         inspect_lora_model_state(model, require_trainable=False)
+
+
+def test_real_peft_wrapper_is_valid_during_training_and_after_freeze() -> None:
+    torch = pytest.importorskip("torch")
+    peft = pytest.importorskip("peft")
+
+    class TinyLinearModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Linear(4, 4)
+
+        def forward(self, inputs: object) -> object:
+            return self.linear(inputs)
+
+    model = peft.get_peft_model(
+        TinyLinearModel(),
+        peft.LoraConfig(
+            r=2,
+            lora_alpha=4,
+            target_modules=["linear"],
+            bias="none",
+        ),
+    )
+    training_state = inspect_lora_model_state(model, require_trainable=True)
+    assert training_state["trainable_parameters"] > 0
+    assert training_state["frozen_parameters"] > 0
+    assert training_state["total_parameters"] == (
+        training_state["trainable_parameters"]
+        + training_state["frozen_parameters"]
+    )
+    assert training_state["adapter_attached"] is True
+    assert training_state["adapter_active"] is True
+    assert training_state["active_adapter_names"] == ["default"]
+    assert training_state["adapter_tensor_count"] > 0
+    assert training_state["adapter_parameter_count"] > 0
+
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    reload_state = inspect_lora_model_state(model, require_trainable=False)
+    assert reload_state["trainable_parameters"] == 0
+    assert reload_state["frozen_parameters"] == reload_state["total_parameters"]
+    assert reload_state["adapter_attached"] is True
+    assert reload_state["adapter_active"] is True
+    assert reload_state["active_adapter_names"] == ["default"]
+    assert reload_state["adapter_tensor_count"] > 0
+    assert reload_state["adapter_parameter_count"] > 0
 
 
 class FakeCuda:
