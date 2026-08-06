@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE="${1:?Usage: $0 {dry-run|smoke|search} SIGNED_RESIDUAL_15MIN_PARQUET}"
-INPUT="${2:?Usage: $0 {dry-run|smoke|search} SIGNED_RESIDUAL_15MIN_PARQUET}"
+if [[ "$#" -ne 2 ]]; then
+  echo "Usage: $0 {dry-run|smoke|search} SIGNED_RESIDUAL_15MIN_PARQUET" >&2
+  exit 64
+fi
+
+STAGE="$1"
+INPUT="$2"
 case "${STAGE}" in
   dry-run|smoke|search) ;;
-  *) echo "Stage must be dry-run, smoke, or search: ${STAGE}"; exit 2 ;;
+  *) echo "Stage must be dry-run, smoke, or search: ${STAGE}" >&2; exit 64 ;;
 esac
 CONFIG="${CONFIG:-configs/foshan_chronos2_residual.json}"
 HF_HOME="${HF_HOME:-${MODEL_CACHE:-$HOME/.cache/huggingface}}"

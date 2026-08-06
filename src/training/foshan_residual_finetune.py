@@ -12,10 +12,12 @@ import os
 import sys
 import time
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import numpy as np
 import pandas as pd
@@ -314,6 +316,306 @@ def _directory_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _parameter_counts(model: Any) -> dict[str, int]:
+    parameters = list(model.parameters())
+    total = sum(int(value.numel()) for value in parameters)
+    trainable = sum(int(value.numel()) for value in parameters if value.requires_grad)
+    return {
+        "trainable_parameters": trainable,
+        "total_parameters": total,
+        "frozen_parameters": total - trainable,
+    }
+
+
+def _adapter_names(value: Any, field: str) -> list[str]:
+    if value == "irregular":
+        raise RuntimeError(f"PEFT reports irregular {field} state.")
+    if isinstance(value, str):
+        return [value]
+    if value is None:
+        return []
+    return [str(name) for name in value]
+
+
+def _peft_type_name(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw).upper().split(".")[-1]
+
+
+def _loaded_adapter_tensor_stats(model: Any, adapter_names: list[str]) -> tuple[int, int]:
+    state_getter = getattr(model, "get_adapter_state_dict", None)
+    tensor_count = 0
+    parameter_count = 0
+    for adapter_name in adapter_names:
+        if callable(state_getter):
+            state = state_getter(adapter_name=adapter_name)
+        else:
+            try:
+                from peft import get_peft_model_state_dict
+            except ImportError as error:
+                raise RuntimeError(
+                    "PEFT does not expose an adapter state-dict API for reload verification."
+                ) from error
+            state = get_peft_model_state_dict(model, adapter_name=adapter_name)
+        if not isinstance(state, dict) or not state:
+            raise RuntimeError(
+                f"Active PEFT adapter {adapter_name!r} has no loaded tensors."
+            )
+        for tensor in state.values():
+            if not hasattr(tensor, "numel"):
+                raise RuntimeError(
+                    f"Active PEFT adapter {adapter_name!r} contains a non-tensor value."
+                )
+            tensor_count += 1
+            parameter_count += int(tensor.numel())
+    if tensor_count <= 0 or parameter_count <= 0:
+        raise RuntimeError("No active LoRA adapter tensors were loaded.")
+    return tensor_count, parameter_count
+
+
+def inspect_lora_model_state(
+    model: Any,
+    *,
+    require_trainable: bool,
+) -> dict[str, Any]:
+    """Validate public PEFT state and count parameters without importing it in tests."""
+    peft_config = getattr(model, "peft_config", None)
+    if not isinstance(peft_config, dict) or not peft_config:
+        raise RuntimeError("Loaded Chronos-2 model is base-only; no PEFT adapter is registered.")
+    status_getter = getattr(model, "get_model_status", None)
+    if not callable(status_getter):
+        try:
+            from peft import get_model_status
+        except ImportError as error:
+            raise RuntimeError(
+                "Loaded model does not expose PEFT model-status validation."
+            ) from error
+        status = get_model_status(model)
+    else:
+        status = status_getter()
+
+    enabled = getattr(status, "enabled", None)
+    if enabled is not True:
+        raise RuntimeError(f"Loaded PEFT adapter is not enabled: {enabled!r}.")
+    active = _adapter_names(getattr(status, "active_adapters", None), "active adapter")
+    available = _adapter_names(
+        getattr(status, "available_adapters", None), "available adapter"
+    )
+    if not active:
+        raise RuntimeError("Loaded PEFT model has no active adapter.")
+    if not set(active).issubset(set(available)):
+        raise RuntimeError(
+            f"Active adapters {active} are not registered in available adapters {available}."
+        )
+    if not set(active).issubset(set(str(name) for name in peft_config)):
+        raise RuntimeError(
+            f"Active adapters {active} are absent from PEFT configuration {list(peft_config)}."
+        )
+    peft_types = getattr(status, "peft_types", {})
+    if not isinstance(peft_types, dict) or any(
+        _peft_type_name(peft_types.get(name)) != "LORA" for name in active
+    ):
+        raise RuntimeError(f"Active adapter is not LoRA: {peft_types!r}.")
+    adapter_layers = int(getattr(status, "num_adapter_layers", 0))
+    if adapter_layers <= 0:
+        raise RuntimeError("Loaded PEFT model has no adapter layers.")
+
+    counts = _parameter_counts(model)
+    status_trainable = getattr(status, "trainable_params", None)
+    status_total = getattr(status, "total_params", None)
+    if status_trainable is not None and int(status_trainable) != counts["trainable_parameters"]:
+        raise RuntimeError("PEFT and model trainable-parameter counts disagree.")
+    if status_total is not None and int(status_total) != counts["total_parameters"]:
+        raise RuntimeError("PEFT and model total-parameter counts disagree.")
+    if require_trainable:
+        if counts["trainable_parameters"] <= 0 or counts["frozen_parameters"] <= 0:
+            raise RuntimeError(
+                "LoRA training state must contain both trainable adapter and frozen base parameters."
+            )
+    tensor_count, adapter_parameter_count = _loaded_adapter_tensor_stats(model, active)
+    return {
+        **counts,
+        "adapter_attached": True,
+        "adapter_active": True,
+        "active_adapter_names": active,
+        "available_adapter_names": available,
+        "adapter_layer_count": adapter_layers,
+        "adapter_tensor_count": tensor_count,
+        "adapter_parameter_count": adapter_parameter_count,
+    }
+
+
+def _training_parameter_metadata(model: Any, fine_tune_mode: str) -> dict[str, Any]:
+    if fine_tune_mode == "lora":
+        state = inspect_lora_model_state(model, require_trainable=True)
+        return {
+            "trainable_parameters": state["trainable_parameters"],
+            "frozen_parameters": state["frozen_parameters"],
+            "total_parameters": state["total_parameters"],
+            "training_adapter_attached": state["adapter_attached"],
+            "training_adapter_active": state["adapter_active"],
+            "training_active_adapter_names": state["active_adapter_names"],
+            "training_adapter_layer_count": state["adapter_layer_count"],
+            "training_adapter_tensor_count": state["adapter_tensor_count"],
+            "training_adapter_parameter_count": state["adapter_parameter_count"],
+            "training_adapter_validation_status": "passed",
+            "training_parameter_capture_point": "chronos2_pipeline_fit_return",
+        }
+    counts = _parameter_counts(model)
+    if counts["trainable_parameters"] != counts["total_parameters"]:
+        raise RuntimeError(
+            "Full fine-tuning returned a model with frozen parameters: "
+            f"{counts['trainable_parameters']}/{counts['total_parameters']}."
+        )
+    return {
+        **counts,
+        "training_parameter_capture_point": "chronos2_pipeline_fit_return",
+    }
+
+
+def _validate_training_parameter_metadata(
+    metadata: dict[str, Any], fine_tune_mode: str
+) -> None:
+    try:
+        trainable = int(metadata["trainable_parameters"])
+        frozen = int(metadata["frozen_parameters"])
+        total = int(metadata["total_parameters"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("Training-time parameter metadata is missing or invalid.") from error
+    if total != trainable + frozen:
+        raise RuntimeError(
+            "Training-time total parameters do not equal trainable plus frozen parameters."
+        )
+    if fine_tune_mode == "lora":
+        if trainable <= 0 or frozen <= 0:
+            raise RuntimeError(
+                "LoRA training metadata must report positive trainable and frozen counts."
+            )
+        for field in (
+            "training_adapter_attached",
+            "training_adapter_active",
+        ):
+            if metadata.get(field) is not True:
+                raise RuntimeError(f"LoRA training metadata failed {field} validation.")
+        if metadata.get("training_adapter_validation_status") != "passed":
+            raise RuntimeError("LoRA training adapter validation did not pass.")
+        if metadata.get("training_parameter_capture_point") != "chronos2_pipeline_fit_return":
+            raise RuntimeError("LoRA parameter counts were not captured at the Chronos fit return.")
+        if not metadata.get("training_active_adapter_names") or int(
+            metadata.get("training_adapter_tensor_count", 0)
+        ) <= 0:
+            raise RuntimeError("LoRA training metadata has no active adapter tensors.")
+    elif trainable != total:
+        raise RuntimeError("Full fine-tuning metadata must report every parameter trainable.")
+
+
+@contextmanager
+def capture_chronos2_training_state(
+    fine_tune_mode: str,
+    *,
+    pipeline_class: Any | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Capture the model returned by Chronos fit before AutoGluon serializes it."""
+    if pipeline_class is None:
+        from chronos import Chronos2Pipeline
+
+        pipeline_class = Chronos2Pipeline
+    original_fit = pipeline_class.fit
+    captured: dict[str, Any] = {}
+    completed = False
+
+    @wraps(original_fit)
+    def monitored_fit(pipeline: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original_fit(pipeline, *args, **kwargs)
+        actual_mode = str(kwargs.get("finetune_mode", "full"))
+        if actual_mode != fine_tune_mode:
+            raise RuntimeError(
+                f"Chronos trained in {actual_mode!r}, expected {fine_tune_mode!r}."
+            )
+        if captured:
+            raise RuntimeError("Expected exactly one Chronos-2 fine-tuning lifecycle.")
+        model = getattr(result, "model", None)
+        if model is None:
+            raise RuntimeError("Chronos-2 fit returned no inspectable model.")
+        captured.update(_training_parameter_metadata(model, fine_tune_mode))
+        return result
+
+    pipeline_class.fit = monitored_fit
+    try:
+        yield captured
+        completed = True
+    finally:
+        pipeline_class.fit = original_fit
+    if completed and not captured:
+        raise RuntimeError("Chronos-2 fit completed without training-state capture.")
+
+
+def _validate_lora_artifacts(
+    checkpoint: Path,
+    *,
+    snapshot: Path | None = None,
+    expected_lora_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    adapter_configs = sorted(checkpoint.rglob("adapter_config.json"))
+    adapter_models = sorted(checkpoint.rglob("adapter_model.safetensors"))
+    if len(adapter_configs) != 1:
+        raise RuntimeError(
+            "LoRA checkpoint must contain exactly one adapter_config.json; "
+            f"found {adapter_configs}."
+        )
+    if len(adapter_models) != 1:
+        raise RuntimeError(
+            "LoRA checkpoint must contain exactly one adapter_model.safetensors; "
+            f"found {adapter_models}."
+        )
+    config_path = adapter_configs[0]
+    model_path = adapter_models[0]
+    if config_path.stat().st_size <= 0 or model_path.stat().st_size <= 0:
+        raise RuntimeError("LoRA adapter artifacts must be nonempty.")
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Invalid LoRA adapter configuration: {config_path}.") from error
+    if not isinstance(config, dict) or _peft_type_name(config.get("peft_type")) != "LORA":
+        raise RuntimeError("Adapter configuration is not a valid LoRA configuration.")
+    auto_mapping = config.get("auto_mapping")
+    if isinstance(auto_mapping, dict) and auto_mapping.get("base_model_class") not in (
+        None,
+        "Chronos2Model",
+    ):
+        raise RuntimeError("LoRA adapter configuration targets a non-Chronos-2 base model.")
+    base_source = str(config.get("base_model_name_or_path", ""))
+    if snapshot is not None:
+        snapshot_matches = False
+        if base_source:
+            try:
+                snapshot_matches = Path(base_source).expanduser().resolve() == snapshot.resolve()
+            except OSError:
+                snapshot_matches = False
+        if base_source != MODEL_ID and not snapshot_matches:
+            raise RuntimeError(
+                f"LoRA adapter base source {base_source!r} does not match the pinned Chronos-2 base."
+            )
+    if expected_lora_config is not None:
+        for field in ("r", "lora_alpha"):
+            expected = expected_lora_config.get(field)
+            actual = config.get(field)
+            try:
+                matches = expected is None or int(actual) == int(expected)
+            except (TypeError, ValueError):
+                matches = False
+            if not matches:
+                raise RuntimeError(
+                    f"LoRA adapter {field}={actual!r} does not match saved "
+                    f"AutoGluon configuration {expected!r}."
+                )
+    return {
+        "adapter_config_path": config_path,
+        "adapter_model_path": model_path,
+        "adapter_config": config,
+    }
+
+
 def find_fine_tuned_checkpoint(
     predictor_path: Path,
     fine_tune_mode: str,
@@ -327,15 +629,13 @@ def find_fine_tuned_checkpoint(
         )
     checkpoint = checkpoints[0]
     adapters = sorted(checkpoint.rglob("adapter_model.safetensors"))
+    adapter_configs = sorted(checkpoint.rglob("adapter_config.json"))
     weights = sorted(checkpoint.rglob("*.safetensors")) + sorted(
         checkpoint.rglob("pytorch_model*.bin")
     )
-    if fine_tune_mode == "lora" and len(adapters) != 1:
-        raise RuntimeError(
-            "LoRA checkpoint must contain exactly one adapter_model.safetensors; "
-            f"found {adapters}."
-        )
-    if fine_tune_mode == "full" and (adapters or not weights):
+    if fine_tune_mode == "lora":
+        _validate_lora_artifacts(checkpoint)
+    if fine_tune_mode == "full" and (adapters or adapter_configs or not weights):
         raise RuntimeError("Full checkpoint must contain full weights and no LoRA adapter.")
     return checkpoint, weights
 
@@ -346,8 +646,6 @@ def verify_loaded_predictor(
     model_name: str,
     fine_tune_mode: str,
     snapshot: Path,
-    *,
-    inspect_parameters: bool = True,
 ) -> dict[str, Any]:
     names = [str(value) for value in predictor.model_names()]
     if model_name not in names or len([value for value in names if value.startswith("Chronos2")]) != 1:
@@ -369,12 +667,15 @@ def verify_loaded_predictor(
         raise RuntimeError(
             f"Reloaded model silently changed base checkpoint: {saved_source} != {snapshot}."
         )
-    counts = {
-        "trainable_parameters": None,
-        "total_parameters": None,
-        "frozen_parameters": None,
-    }
-    if inspect_parameters:
+    checkpoint, weight_files = find_fine_tuned_checkpoint(predictor_path, fine_tune_mode)
+    artifact_info: dict[str, Any] = {}
+    if fine_tune_mode == "lora":
+        artifact_info = _validate_lora_artifacts(
+            checkpoint,
+            snapshot=snapshot,
+            expected_lora_config=hyperparameters.get("fine_tune_lora_config"),
+        )
+    try:
         ag_model.load_model_pipeline()
         pipeline = getattr(ag_model, "_model_pipeline", None)
         core = getattr(pipeline, "model", None)
@@ -382,25 +683,56 @@ def verify_loaded_predictor(
             core = getattr(pipeline, "_model", None)
         if core is None:
             raise RuntimeError("Could not inspect the reloaded Chronos-2 model parameters.")
-        parameters = list(core.parameters())
-        total = sum(int(value.numel()) for value in parameters)
-        trainable = sum(int(value.numel()) for value in parameters if value.requires_grad)
-        counts = {
-            "trainable_parameters": trainable,
-            "total_parameters": total,
-            "frozen_parameters": total - trainable,
+        if fine_tune_mode == "lora":
+            reload_state = inspect_lora_model_state(core, require_trainable=False)
+            expected_lora_config = hyperparameters.get("fine_tune_lora_config") or {}
+            for adapter_name in reload_state["active_adapter_names"]:
+                loaded_config = core.peft_config[adapter_name]
+                for field in ("r", "lora_alpha"):
+                    expected = expected_lora_config.get(field)
+                    actual = getattr(loaded_config, field, None)
+                    try:
+                        matches = expected is None or int(actual) == int(expected)
+                    except (TypeError, ValueError):
+                        matches = False
+                    if not matches:
+                        raise RuntimeError(
+                            f"Loaded LoRA adapter {field}={actual!r} does not match "
+                            f"saved AutoGluon configuration {expected!r}."
+                        )
+            adapter_reload = {
+                "adapter_attached_after_reload": reload_state["adapter_attached"],
+                "adapter_active_after_reload": reload_state["adapter_active"],
+                "active_adapter_names": reload_state["active_adapter_names"],
+                "available_adapter_names": reload_state["available_adapter_names"],
+                "reload_adapter_layer_count": reload_state["adapter_layer_count"],
+                "reload_adapter_tensor_count": reload_state["adapter_tensor_count"],
+                "reload_adapter_parameter_count": reload_state["adapter_parameter_count"],
+                "base_model_fallback_rejected": True,
+                "adapter_validation_status": "passed",
+            }
+        else:
+            reload_state = _parameter_counts(core)
+            adapter_reload = {
+                "adapter_attached_after_reload": False,
+                "adapter_active_after_reload": False,
+                "active_adapter_names": [],
+                "base_model_fallback_rejected": True,
+                "adapter_validation_status": "not_applicable",
+            }
+        reload_counts = {
+            "reload_trainable_parameters": reload_state["trainable_parameters"],
+            "reload_total_parameters": reload_state["total_parameters"],
+            "reload_frozen_parameters": reload_state["frozen_parameters"],
         }
-        if fine_tune_mode == "full" and trainable != total:
-            raise RuntimeError(
-                f"Full fine-tuning left parameters frozen: {trainable}/{total} trainable."
-            )
+    finally:
         ag_model._model_pipeline = None
-        del core, pipeline
         gc.collect()
-    checkpoint, weight_files = find_fine_tuned_checkpoint(predictor_path, fine_tune_mode)
-    adapter_files = sorted(checkpoint.rglob("adapter_model.safetensors"))
+    adapter_model = artifact_info.get("adapter_model_path")
+    adapter_config = artifact_info.get("adapter_config_path")
     return {
-        **counts,
+        **reload_counts,
+        **adapter_reload,
         "checkpoint_path": str(checkpoint.resolve()),
         "checkpoint_sha256": _directory_sha256(checkpoint),
         "checkpoint_size_bytes": sum(
@@ -408,13 +740,22 @@ def verify_loaded_predictor(
         ),
         "checkpoint_weight_files": [str(value.resolve()) for value in weight_files],
         "adapter_model_path": (
-            str(adapter_files[0].resolve()) if adapter_files else None
+            str(adapter_model.resolve()) if adapter_model is not None else None
         ),
         "adapter_model_sha256": (
-            sha256_file(adapter_files[0]) if adapter_files else None
+            sha256_file(adapter_model) if adapter_model is not None else None
         ),
         "adapter_model_size_bytes": (
-            int(adapter_files[0].stat().st_size) if adapter_files else None
+            int(adapter_model.stat().st_size) if adapter_model is not None else None
+        ),
+        "adapter_config_path": (
+            str(adapter_config.resolve()) if adapter_config is not None else None
+        ),
+        "adapter_config_sha256": (
+            sha256_file(adapter_config) if adapter_config is not None else None
+        ),
+        "adapter_config_size_bytes": (
+            int(adapter_config.stat().st_size) if adapter_config is not None else None
         ),
         "base_model_source_verified": str(snapshot.resolve()),
         "fine_tune_mode_verified": fine_tune_mode,
@@ -430,12 +771,11 @@ def fit_residual_candidate(
     candidate_dir: Path,
     *,
     dataloader_num_workers: int = 0,
-    autogluon_classes: tuple[Any, Any] | None = None,
 ) -> tuple[Any, Any, str, dict[str, Any]]:
     predictor_path = candidate_dir / "predictor"
     if predictor_path.exists():
         raise FileExistsError(f"Refusing to overwrite predictor: {predictor_path}")
-    dataframe_class, predictor_class = autogluon_classes or _load_autogluon()
+    dataframe_class, predictor_class = _load_autogluon()
     train_data = dataframe_class.from_data_frame(
         frames.train, id_column="id", timestamp_column="timestamp"
     )
@@ -458,24 +798,24 @@ def fit_residual_candidate(
         eval_metric="WQL",
         freq=str(config["frequency"]),
     )
-    torch_module: Any | None = None
-    if autogluon_classes is None:
-        import torch
+    import torch
 
-        torch_module = torch
-        torch.cuda.set_device(0)
-        torch.cuda.reset_peak_memory_stats(0)
+    torch.cuda.set_device(0)
+    torch.cuda.reset_peak_memory_stats(0)
+    fit_kwargs = {
+        "train_data": train_data,
+        "tuning_data": tuning_data,
+        "hyperparameters": hyperparameters,
+        "enable_ensemble": False,
+        "random_seed": int(candidate["seed"]),
+        "refit_full": False,
+        "skip_model_selection": False,
+    }
     started = time.monotonic()
-    predictor.fit(
-        train_data=train_data,
-        tuning_data=tuning_data,
-        hyperparameters=hyperparameters,
-        enable_ensemble=False,
-        random_seed=int(candidate["seed"]),
-        refit_full=False,
-        skip_model_selection=False,
-    )
+    with capture_chronos2_training_state(fine_tune_mode) as training_state:
+        predictor.fit(**fit_kwargs)
     runtime = time.monotonic() - started
+    _validate_training_parameter_metadata(training_state, fine_tune_mode)
     names = [str(value) for value in predictor.model_names()]
     trained = [value for value in names if value.startswith("Chronos2")]
     if len(trained) != 1:
@@ -487,19 +827,15 @@ def fit_residual_candidate(
         trained[0],
         fine_tune_mode,
         snapshot,
-        inspect_parameters=autogluon_classes is None,
     )
     stats = {
         "training_runtime_seconds": runtime,
-        "peak_allocated_gpu_bytes": (
-            int(torch_module.cuda.max_memory_allocated(0)) if torch_module else None
-        ),
-        "peak_reserved_gpu_bytes": (
-            int(torch_module.cuda.max_memory_reserved(0)) if torch_module else None
-        ),
+        "peak_allocated_gpu_bytes": int(torch.cuda.max_memory_allocated(0)),
+        "peak_reserved_gpu_bytes": int(torch.cuda.max_memory_reserved(0)),
         "trained_model_name": trained[0],
         "predictor_path": str(predictor_path.resolve()),
         "autogluon_hyperparameters": hyperparameters,
+        **training_state,
         **inspection,
     }
     return reloaded, dataframe_class, trained[0], stats
@@ -733,6 +1069,36 @@ def _validate_completed_candidate(candidate_dir: Path, manifest: dict[str, Any])
         raise RuntimeError(
             f"Completed candidate checkpoint hash changed in {candidate_dir}."
         )
+    fine_tune_mode = str(manifest["fine_tune_mode"])
+    _validate_training_parameter_metadata(manifest, fine_tune_mode)
+    if fine_tune_mode == "lora":
+        required_reload = {
+            "adapter_attached_after_reload": True,
+            "adapter_active_after_reload": True,
+            "base_model_fallback_rejected": True,
+            "adapter_validation_status": "passed",
+        }
+        failures = [
+            field
+            for field, expected in required_reload.items()
+            if manifest.get(field) != expected
+        ]
+        if failures or not manifest.get("active_adapter_names"):
+            raise RuntimeError(
+                "Completed LoRA candidate lacks verified active-adapter reload metadata: "
+                f"{failures}."
+            )
+        try:
+            reload_trainable = int(manifest["reload_trainable_parameters"])
+            reload_frozen = int(manifest["reload_frozen_parameters"])
+            reload_total = int(manifest["reload_total_parameters"])
+            reload_tensors = int(manifest["reload_adapter_tensor_count"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Completed LoRA candidate lacks valid reload parameter metadata."
+            ) from error
+        if reload_total != reload_trainable + reload_frozen or reload_tensors <= 0:
+            raise RuntimeError("Completed LoRA candidate reload metadata is inconsistent.")
 
 
 def resolve_candidate_attempt(

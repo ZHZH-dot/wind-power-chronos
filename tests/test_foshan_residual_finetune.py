@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +23,7 @@ from src.evaluation.foshan_residual_revenue import (
     select_by_april_revenue,
 )
 from src.models.foshan_residual_zero_shot import (
+    MODEL_ID,
     MODEL_REVISION,
     load_residual_config,
     resolve_pinned_snapshot,
@@ -27,8 +31,10 @@ from src.models.foshan_residual_zero_shot import (
 import src.training.foshan_residual_finetune as residual_finetune
 from src.training.foshan_residual_finetune import (
     build_residual_hyperparameters,
+    capture_chronos2_training_state,
     find_fine_tuned_checkpoint,
     gpu_preflight,
+    inspect_lora_model_state,
     prepare_residual_training_frames,
     predict_saved_period,
     resolve_candidate_attempt,
@@ -113,78 +119,286 @@ def test_local_snapshot_validation_fails_closed(tmp_path: Path) -> None:
         resolve_pinned_snapshot(model_path=incomplete, allow_download=False)
 
 
-class FakeModel:
-    def __init__(self, model_path: Path, mode: str) -> None:
+class FakeTensor:
+    def __init__(self, size: int, *, requires_grad: bool = False) -> None:
+        self.size = size
+        self.requires_grad = requires_grad
+
+    def numel(self) -> int:
+        return self.size
+
+
+class FakePeftModel:
+    def __init__(
+        self,
+        *,
+        trainable: bool = False,
+        enabled: bool = True,
+        active: list[str] | None = None,
+        rank: int = 8,
+        alpha: int = 16,
+    ) -> None:
+        self.active = ["default"] if active is None else active
+        self.enabled = enabled
+        self.peft_config = {
+            "default": SimpleNamespace(peft_type="LORA", r=rank, lora_alpha=alpha)
+        }
+        self._parameters = [
+            FakeTensor(1_000),
+            FakeTensor(32, requires_grad=trainable),
+            FakeTensor(32, requires_grad=trainable),
+        ]
+
+    def parameters(self) -> list[FakeTensor]:
+        return self._parameters
+
+    def get_model_status(self) -> SimpleNamespace:
+        trainable = sum(value.numel() for value in self._parameters if value.requires_grad)
+        total = sum(value.numel() for value in self._parameters)
+        return SimpleNamespace(
+            enabled=self.enabled,
+            active_adapters=self.active,
+            available_adapters=["default"],
+            peft_types={"default": "LORA"},
+            num_adapter_layers=2,
+            trainable_params=trainable,
+            total_params=total,
+        )
+
+    def get_adapter_state_dict(self, *, adapter_name: str) -> dict[str, FakeTensor]:
+        if adapter_name != "default":
+            return {}
+        return {
+            "layer.lora_A.weight": FakeTensor(32),
+            "layer.lora_B.weight": FakeTensor(32),
+        }
+
+
+class FakeBaseModel:
+    def parameters(self) -> list[FakeTensor]:
+        return [FakeTensor(1_000)]
+
+
+class FakeAutoGluonModel:
+    def __init__(self, model_path: Path, mode: str, core: object) -> None:
         self.model_path = model_path
         self.mode = mode
+        self.core = core
+        self._model_pipeline = None
 
     def get_hyperparameters(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "fine_tune": True,
             "fine_tune_mode": self.mode,
             "model_path": str(self.model_path),
         }
+        if self.mode == "lora":
+            result["fine_tune_lora_config"] = {"r": 8, "lora_alpha": 16}
+        return result
+
+    def load_model_pipeline(self) -> None:
+        self._model_pipeline = SimpleNamespace(model=self.core)
 
 
 class FakeTrainer:
-    def __init__(self, model: FakeModel) -> None:
+    def __init__(self, model: FakeAutoGluonModel) -> None:
         self.model = model
 
-    def load_model(self, _name: str) -> FakeModel:
+    def load_model(self, _name: str) -> FakeAutoGluonModel:
         return self.model
 
 
 class FakePredictor:
-    def __init__(self, model: FakeModel) -> None:
+    def __init__(self, model: FakeAutoGluonModel) -> None:
         self._trainer = FakeTrainer(model)
 
     def model_names(self) -> list[str]:
         return ["Chronos2ResidualLoRA"]
 
 
-def test_checkpoint_verification_cannot_fall_back_to_base_model(tmp_path: Path) -> None:
+def _write_adapter_artifacts(
+    checkpoint: Path,
+    *,
+    rank: int = 8,
+    alpha: int = 16,
+    base_source: str = MODEL_ID,
+) -> None:
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    (checkpoint / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "base_model_name_or_path": base_source,
+                "inference_mode": True,
+                "r": rank,
+                "lora_alpha": alpha,
+                "auto_mapping": {"base_model_class": "Chronos2Model"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+
+
+def test_training_parameter_capture_records_real_lora_state() -> None:
+    class FakeChronosPipeline:
+        def fit(self, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(model=FakePeftModel(trainable=True))
+
+    original_fit = FakeChronosPipeline.fit
+    with capture_chronos2_training_state(
+        "lora", pipeline_class=FakeChronosPipeline
+    ) as metadata:
+        FakeChronosPipeline().fit(finetune_mode="lora")
+
+    assert FakeChronosPipeline.fit is original_fit
+    assert metadata["trainable_parameters"] == 64
+    assert metadata["frozen_parameters"] == 1_000
+    assert metadata["total_parameters"] == 1_064
+    assert metadata["total_parameters"] == (
+        metadata["trainable_parameters"] + metadata["frozen_parameters"]
+    )
+    assert metadata["training_adapter_active"] is True
+    assert metadata["training_parameter_capture_point"] == "chronos2_pipeline_fit_return"
+
+
+def test_checkpoint_verification_separates_reload_state_and_rejects_base_fallback(
+    tmp_path: Path,
+) -> None:
     snapshot = tmp_path / MODEL_REVISION
     snapshot.mkdir()
     predictor_path = tmp_path / "predictor"
     checkpoint = predictor_path / "models" / "Chronos2ResidualLoRA" / "fine-tuned-ckpt"
-    checkpoint.mkdir(parents=True)
-    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
-    predictor = FakePredictor(FakeModel(snapshot, "lora"))
+    _write_adapter_artifacts(checkpoint)
+    predictor = FakePredictor(
+        FakeAutoGluonModel(snapshot, "lora", FakePeftModel(trainable=False))
+    )
     result = verify_loaded_predictor(
         predictor,
         predictor_path,
         "Chronos2ResidualLoRA",
         "lora",
         snapshot,
-        inspect_parameters=False,
     )
     assert result["base_model_source_verified"] == str(snapshot.resolve())
     assert result["fine_tune_mode_verified"] == "lora"
+    assert result["reload_trainable_parameters"] == 0
+    assert result["reload_frozen_parameters"] == 1_064
+    assert result["reload_total_parameters"] == 1_064
+    assert result["adapter_attached_after_reload"] is True
+    assert result["adapter_active_after_reload"] is True
+    assert result["active_adapter_names"] == ["default"]
+    assert result["reload_adapter_tensor_count"] == 2
+    assert result["adapter_validation_status"] == "passed"
+    assert result["base_model_fallback_rejected"] is True
 
-    fallback = FakePredictor(FakeModel(Path("amazon/chronos-2"), "lora"))
+    wrong_source = FakePredictor(
+        FakeAutoGluonModel(Path("amazon/chronos-2"), "lora", FakePeftModel())
+    )
     with pytest.raises(RuntimeError, match="silently changed base checkpoint"):
+        verify_loaded_predictor(
+            wrong_source,
+            predictor_path,
+            "Chronos2ResidualLoRA",
+            "lora",
+            snapshot,
+        )
+
+    fallback = FakePredictor(
+        FakeAutoGluonModel(snapshot, "lora", FakeBaseModel())
+    )
+    with pytest.raises(RuntimeError, match="base-only"):
         verify_loaded_predictor(
             fallback,
             predictor_path,
             "Chronos2ResidualLoRA",
             "lora",
             snapshot,
-            inspect_parameters=False,
         )
 
 
-def test_lora_checkpoint_requires_exactly_one_adapter(tmp_path: Path) -> None:
+def test_disabled_or_mismatched_lora_adapter_is_rejected(tmp_path: Path) -> None:
+    snapshot = tmp_path / MODEL_REVISION
+    snapshot.mkdir()
+    predictor_path = tmp_path / "predictor"
+    checkpoint = predictor_path / "models" / "Chronos2ResidualLoRA" / "fine-tuned-ckpt"
+    _write_adapter_artifacts(checkpoint)
+    disabled = FakePredictor(
+        FakeAutoGluonModel(
+            snapshot,
+            "lora",
+            FakePeftModel(trainable=False, enabled=False),
+        )
+    )
+    with pytest.raises(RuntimeError, match="not enabled"):
+        verify_loaded_predictor(
+            disabled,
+            predictor_path,
+            "Chronos2ResidualLoRA",
+            "lora",
+            snapshot,
+        )
+
+    _write_adapter_artifacts(checkpoint, rank=16, alpha=32)
+    with pytest.raises(RuntimeError, match="does not match saved AutoGluon"):
+        verify_loaded_predictor(
+            FakePredictor(
+                FakeAutoGluonModel(snapshot, "lora", FakePeftModel(trainable=False))
+            ),
+            predictor_path,
+            "Chronos2ResidualLoRA",
+            "lora",
+            snapshot,
+        )
+
+    _write_adapter_artifacts(checkpoint)
+    with pytest.raises(RuntimeError, match="Loaded LoRA adapter r"):
+        verify_loaded_predictor(
+            FakePredictor(
+                FakeAutoGluonModel(
+                    snapshot,
+                    "lora",
+                    FakePeftModel(trainable=False, rank=16, alpha=32),
+                )
+            ),
+            predictor_path,
+            "Chronos2ResidualLoRA",
+            "lora",
+            snapshot,
+        )
+
+
+def test_lora_checkpoint_requires_complete_unique_nonempty_artifacts(tmp_path: Path) -> None:
     predictor_path = tmp_path / "predictor"
     checkpoint = predictor_path / "models" / "Chronos2ResidualLoRA" / "fine-tuned-ckpt"
     checkpoint.mkdir(parents=True)
-    with pytest.raises(RuntimeError, match="exactly one adapter"):
+    with pytest.raises(RuntimeError, match="adapter_config.json"):
+        find_fine_tuned_checkpoint(predictor_path, "lora")
+    _write_adapter_artifacts(checkpoint)
+    (checkpoint / "adapter_model.safetensors").unlink()
+    with pytest.raises(RuntimeError, match="adapter_model.safetensors"):
+        find_fine_tuned_checkpoint(predictor_path, "lora")
+    _write_adapter_artifacts(checkpoint)
+    (checkpoint / "adapter_config.json").unlink()
+    with pytest.raises(RuntimeError, match="adapter_config.json"):
+        find_fine_tuned_checkpoint(predictor_path, "lora")
+    _write_adapter_artifacts(checkpoint)
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"")
+    with pytest.raises(RuntimeError, match="nonempty"):
         find_fine_tuned_checkpoint(predictor_path, "lora")
     (checkpoint / "adapter_model.safetensors").write_bytes(b"one")
     nested = checkpoint / "duplicate"
     nested.mkdir()
     (nested / "adapter_model.safetensors").write_bytes(b"two")
-    with pytest.raises(RuntimeError, match="exactly one adapter"):
+    with pytest.raises(RuntimeError, match="adapter_model.safetensors"):
         find_fine_tuned_checkpoint(predictor_path, "lora")
+
+
+def test_lora_model_state_requires_loaded_adapter_tensors() -> None:
+    model = FakePeftModel(trainable=False)
+    model.get_adapter_state_dict = lambda **_kwargs: {}
+    with pytest.raises(RuntimeError, match="no loaded tensors"):
+        inspect_lora_model_state(model, require_trainable=False)
 
 
 class FakeCuda:
@@ -312,8 +526,7 @@ def _candidate_artifacts(
 ) -> Path:
     candidate_dir = output_dir / str(candidate["name"])
     checkpoint = candidate_dir / "predictor" / "models" / "Chronos2ResidualLoRA" / "fine-tuned-ckpt"
-    checkpoint.mkdir(parents=True)
-    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    _write_adapter_artifacts(checkpoint)
     (candidate_dir / "candidate_config.json").write_text("{}", encoding="utf-8")
     (candidate_dir / "april_predictions.csv").write_text("issue_time\n", encoding="utf-8")
     (candidate_dir / "april_inference_audit.csv").write_text(
@@ -330,6 +543,24 @@ def _candidate_artifacts(
         "predictor_path": str((candidate_dir / "predictor").resolve()),
         "checkpoint_path": str(checkpoint.resolve()),
         "checkpoint_sha256": residual_finetune._directory_sha256(checkpoint),
+        "trainable_parameters": 64,
+        "frozen_parameters": 1_000,
+        "total_parameters": 1_064,
+        "training_adapter_attached": True,
+        "training_adapter_active": True,
+        "training_active_adapter_names": ["default"],
+        "training_adapter_tensor_count": 2,
+        "training_adapter_validation_status": "passed",
+        "training_parameter_capture_point": "chronos2_pipeline_fit_return",
+        "reload_trainable_parameters": 0,
+        "reload_frozen_parameters": 1_064,
+        "reload_total_parameters": 1_064,
+        "reload_adapter_tensor_count": 2,
+        "adapter_attached_after_reload": True,
+        "adapter_active_after_reload": True,
+        "active_adapter_names": ["default"],
+        "base_model_fallback_rejected": True,
+        "adapter_validation_status": "passed",
     }
     (candidate_dir / "training_manifest.json").write_text(
         json.dumps(manifest), encoding="utf-8"
@@ -592,7 +823,11 @@ def test_canonical_zero_shot_defaults_and_stage_gated_launchers() -> None:
     lora_launcher = Path("scripts/run_foshan_residual_lora_4090.sh").read_text(
         encoding="utf-8"
     )
-    assert 'STAGE="${1:?' in lora_launcher
+    assert 'if [[ "$#" -ne 2 ]]' in lora_launcher
+    assert 'STAGE="$1"' in lora_launcher
+    assert 'INPUT="$2"' in lora_launcher
+    assert '${1:?' not in lora_launcher
+    assert '${2:?' not in lora_launcher
     assert '--stage "${STAGE}"' in lora_launcher
     assert "--stage search" not in lora_launcher
     revenue_launcher = Path("scripts/run_foshan_residual_revenue_eval.sh").read_text(
@@ -601,6 +836,97 @@ def test_canonical_zero_shot_defaults_and_stage_gated_launchers() -> None:
     assert "results/zero_shot/foshan_chronos2/predictions_long.csv" in revenue_launcher
     assert "INPUT_OK:" in revenue_launcher
     assert "INPUT_MISSING:" in revenue_launcher
+
+
+def _bash_executable() -> str | None:
+    git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+    if git_bash.is_file():
+        return str(git_bash)
+    return shutil.which("bash")
+
+
+def _bash_path(path: Path) -> str:
+    return path.resolve().as_posix()
+
+
+@pytest.mark.parametrize("stage", ["dry-run", "smoke", "search"])
+def test_lora_launcher_passes_exact_valid_stage_without_running_training(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    bash = _bash_executable()
+    if bash is None:
+        pytest.skip("Bash is unavailable for the launcher regression test.")
+    snapshot = _write_snapshot(tmp_path / "model with spaces")
+    input_path = tmp_path / "signed residual with spaces.parquet"
+    input_path.write_bytes(b"fixture")
+    output_path = tmp_path / f"output {stage}"
+    launcher = Path("scripts/run_foshan_residual_lora_4090.sh")
+    wrapper = r'''
+python() {
+  printf 'PYTHON_CALL:'
+  printf ' <%s>' "$@"
+  printf '\n'
+}
+nvidia-smi() {
+  printf 'NVIDIA_SMI_CALL\n'
+}
+export -f python nvidia-smi
+bash "$1" "$2" "$3"
+'''
+    environment = {
+        **dict(os.environ),
+        "CHRONOS_MODEL_PATH": _bash_path(snapshot),
+        "OUTPUT_DIR": _bash_path(output_path),
+        "CONFIG": "configs/foshan_chronos2_residual.json",
+    }
+    completed = subprocess.run(
+        [
+            bash,
+            "-c",
+            wrapper,
+            "launcher-test",
+            _bash_path(launcher),
+            stage,
+            _bash_path(input_path),
+        ],
+        cwd=Path.cwd(),
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    module_calls = [
+        line
+        for line in completed.stdout.splitlines()
+        if "src.training.foshan_residual_finetune" in line
+    ]
+    assert len(module_calls) == 1
+    assert f" <--stage> <{stage}>" in module_calls[0]
+    for other_stage in {"dry-run", "smoke", "search"} - {stage}:
+        assert f" <--stage> <{other_stage}>" not in module_calls[0]
+    if stage == "smoke":
+        assert " <--stage> <search>" not in completed.stdout
+
+
+def test_lora_launcher_rejects_missing_and_unknown_stages_before_work(tmp_path: Path) -> None:
+    bash = _bash_executable()
+    if bash is None:
+        pytest.skip("Bash is unavailable for the launcher regression test.")
+    launcher = _bash_path(Path("scripts/run_foshan_residual_lora_4090.sh"))
+    input_path = tmp_path / "input.parquet"
+    input_path.write_bytes(b"fixture")
+    for arguments in ([], ["dry-run"], ["unknown", _bash_path(input_path)]):
+        completed = subprocess.run(
+            [bash, launcher, *arguments],
+            cwd=Path.cwd(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 64
+        assert "PYTHON_CALL" not in completed.stdout
 
 
 def test_residual_launchers_pin_revision_and_do_not_use_device_map_auto() -> None:
