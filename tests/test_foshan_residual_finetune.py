@@ -129,6 +129,14 @@ class FakeTensor:
         return self.size
 
 
+class FakeMergedModel:
+    def __init__(self, parameter_count: int = 1_000) -> None:
+        self._parameters = [FakeTensor(parameter_count)]
+
+    def parameters(self) -> list[FakeTensor]:
+        return self._parameters
+
+
 class FakePeftModel:
     def __init__(
         self,
@@ -138,11 +146,18 @@ class FakePeftModel:
         active: list[str] | None = None,
         rank: int = 8,
         alpha: int = 16,
+        base_source: str = MODEL_ID,
+        merged_model: object | None = None,
     ) -> None:
         self.active = ["default"] if active is None else active
         self.enabled = enabled
         self.peft_config = {
-            "default": SimpleNamespace(peft_type="LORA", r=rank, lora_alpha=alpha)
+            "default": SimpleNamespace(
+                peft_type="LORA",
+                r=rank,
+                lora_alpha=alpha,
+                base_model_name_or_path=base_source,
+            )
         }
         self._parameters = [
             FakeTensor(1_000),
@@ -155,6 +170,8 @@ class FakePeftModel:
                 "layer.lora_B.weight": FakeTensor(32),
             }
         }
+        self.merged_model = merged_model or FakeMergedModel()
+        self.merge_count = 0
 
     def parameters(self) -> list[FakeTensor]:
         return self._parameters
@@ -171,6 +188,10 @@ class FakePeftModel:
             trainable_params=trainable,
             total_params=total,
         )
+
+    def merge_and_unload(self) -> object:
+        self.merge_count += 1
+        return self.merged_model
 
 
 @pytest.fixture
@@ -191,11 +212,33 @@ class FakeBaseModel:
         return [FakeTensor(1_000)]
 
 
+class FakeAutoPeftModel:
+    next_model: object | None = None
+
+    @classmethod
+    def from_pretrained(cls, _path: Path | str, **_kwargs: object) -> object:
+        if cls.next_model is None:
+            raise RuntimeError("Fake AutoPeftModel has no configured model.")
+        return cls.next_model
+
+
 class FakeAutoGluonModel:
-    def __init__(self, model_path: Path, mode: str, core: object) -> None:
+    def __init__(
+        self,
+        model_path: Path,
+        mode: str,
+        core: object,
+        *,
+        reload_path: Path | None = None,
+        load_adapter: bool = True,
+        pipeline_core_override: object | None = None,
+    ) -> None:
         self.model_path = model_path
         self.mode = mode
         self.core = core
+        self.reload_path = reload_path
+        self.load_adapter = load_adapter
+        self.pipeline_core_override = pipeline_core_override
         self._model_pipeline = None
 
     def get_hyperparameters(self) -> dict[str, object]:
@@ -209,7 +252,14 @@ class FakeAutoGluonModel:
         return result
 
     def load_model_pipeline(self) -> None:
-        self._model_pipeline = SimpleNamespace(model=self.core)
+        if self.mode == "lora" and self.load_adapter:
+            FakeAutoPeftModel.next_model = self.core
+            loaded = FakeAutoPeftModel.from_pretrained(self.reload_path)
+            merged = loaded.merge_and_unload()
+            core = self.pipeline_core_override or merged
+        else:
+            core = self.core
+        self._model_pipeline = SimpleNamespace(model=core)
 
 
 class FakeTrainer:
@@ -226,6 +276,22 @@ class FakePredictor:
 
     def model_names(self) -> list[str]:
         return ["Chronos2ResidualLoRA"]
+
+
+def _verify_fake_loaded_predictor(
+    predictor: FakePredictor,
+    predictor_path: Path,
+    snapshot: Path,
+) -> dict[str, object]:
+    return verify_loaded_predictor(
+        predictor,
+        predictor_path,
+        "Chronos2ResidualLoRA",
+        "lora",
+        snapshot,
+        auto_peft_model_class=FakeAutoPeftModel,
+        peft_model_class=FakePeftModel,
+    )
 
 
 def _write_adapter_artifacts(
@@ -284,50 +350,129 @@ def test_checkpoint_verification_separates_reload_state_and_rejects_base_fallbac
     snapshot.mkdir()
     predictor_path = tmp_path / "predictor"
     checkpoint = predictor_path / "models" / "Chronos2ResidualLoRA" / "fine-tuned-ckpt"
-    _write_adapter_artifacts(checkpoint)
+    _write_adapter_artifacts(checkpoint, base_source=str(snapshot.resolve()))
+    premerge = FakePeftModel(
+        trainable=False,
+        base_source=str(snapshot.resolve()),
+    )
     predictor = FakePredictor(
-        FakeAutoGluonModel(snapshot, "lora", FakePeftModel(trainable=False))
+        FakeAutoGluonModel(
+            snapshot,
+            "lora",
+            premerge,
+            reload_path=checkpoint,
+        )
     )
-    result = verify_loaded_predictor(
-        predictor,
-        predictor_path,
-        "Chronos2ResidualLoRA",
-        "lora",
-        snapshot,
-    )
+    result = _verify_fake_loaded_predictor(predictor, predictor_path, snapshot)
     assert result["base_model_source_verified"] == str(snapshot.resolve())
     assert result["fine_tune_mode_verified"] == "lora"
     assert result["reload_trainable_parameters"] == 0
-    assert result["reload_frozen_parameters"] == 1_064
-    assert result["reload_total_parameters"] == 1_064
-    assert result["adapter_attached_after_reload"] is True
-    assert result["adapter_active_after_reload"] is True
-    assert result["active_adapter_names"] == ["default"]
+    assert result["reload_frozen_parameters"] == 1_000
+    assert result["reload_total_parameters"] == 1_000
+    assert result["reload_adapter_premerge_attached"] is True
+    assert result["reload_adapter_premerge_active"] is True
+    assert result["reload_premerge_active_adapter_names"] == ["default"]
     assert result["reload_adapter_tensor_count"] == 2
+    assert result["adapter_application_mode_after_reload"] == "merged_and_unloaded"
+    assert result["adapter_merged_after_reload"] is True
+    assert result["adapter_effect_applied_after_reload"] is True
+    assert result["merged_inference_model_identity_verified"] is True
+    assert result["adapter_attached_after_reload"] is False
+    assert result["adapter_active_after_reload"] is False
+    assert result["active_adapter_names"] == []
     assert result["adapter_validation_status"] == "passed"
     assert result["base_model_fallback_rejected"] is True
+    assert result["reload_adapter_checkpoint_loaded"] == str(checkpoint.resolve())
+    assert premerge.merge_count == 1
 
     wrong_source = FakePredictor(
-        FakeAutoGluonModel(Path("amazon/chronos-2"), "lora", FakePeftModel())
+        FakeAutoGluonModel(
+            Path("amazon/chronos-2"),
+            "lora",
+            premerge,
+            reload_path=checkpoint,
+        )
     )
     with pytest.raises(RuntimeError, match="silently changed base checkpoint"):
-        verify_loaded_predictor(
-            wrong_source,
-            predictor_path,
-            "Chronos2ResidualLoRA",
+        _verify_fake_loaded_predictor(wrong_source, predictor_path, snapshot)
+
+    fallback = FakePredictor(
+        FakeAutoGluonModel(
+            snapshot,
             "lora",
+            FakeBaseModel(),
+            reload_path=checkpoint,
+        )
+    )
+    with pytest.raises(RuntimeError, match="base-only"):
+        _verify_fake_loaded_predictor(fallback, predictor_path, snapshot)
+
+
+def test_reload_requires_exact_checkpoint_snapshot_and_merged_pipeline_core(
+    tmp_path: Path,
+    fake_peft_state_api: None,
+) -> None:
+    snapshot = tmp_path / MODEL_REVISION
+    snapshot.mkdir()
+    predictor_path = tmp_path / "predictor"
+    checkpoint = predictor_path / "models" / "Chronos2ResidualLoRA" / "fine-tuned-ckpt"
+    _write_adapter_artifacts(checkpoint, base_source=str(snapshot.resolve()))
+
+    def predictor_for(
+        core: object,
+        *,
+        reload_path: Path = checkpoint,
+        load_adapter: bool = True,
+        pipeline_core_override: object | None = None,
+    ) -> FakePredictor:
+        return FakePredictor(
+            FakeAutoGluonModel(
+                snapshot,
+                "lora",
+                core,
+                reload_path=reload_path,
+                load_adapter=load_adapter,
+                pipeline_core_override=pipeline_core_override,
+            )
+        )
+
+    wrong_checkpoint = tmp_path / "adapter-elsewhere"
+    wrong_checkpoint.mkdir()
+    with pytest.raises(RuntimeError, match="did not use the verified LoRA checkpoint"):
+        _verify_fake_loaded_predictor(
+            predictor_for(
+                FakePeftModel(base_source=str(snapshot.resolve())),
+                reload_path=wrong_checkpoint,
+            ),
+            predictor_path,
             snapshot,
         )
 
-    fallback = FakePredictor(
-        FakeAutoGluonModel(snapshot, "lora", FakeBaseModel())
-    )
-    with pytest.raises(RuntimeError, match="base-only"):
-        verify_loaded_predictor(
-            fallback,
+    with pytest.raises(RuntimeError, match="skipped the verified LoRA checkpoint"):
+        _verify_fake_loaded_predictor(
+            predictor_for(FakeBaseModel(), load_adapter=False),
             predictor_path,
-            "Chronos2ResidualLoRA",
-            "lora",
+            snapshot,
+        )
+
+    different_snapshot = tmp_path / "different-snapshot"
+    different_snapshot.mkdir()
+    with pytest.raises(RuntimeError, match="does not match the pinned Chronos-2 snapshot"):
+        _verify_fake_loaded_predictor(
+            predictor_for(
+                FakePeftModel(base_source=str(different_snapshot.resolve()))
+            ),
+            predictor_path,
+            snapshot,
+        )
+
+    with pytest.raises(RuntimeError, match="does not use the model returned"):
+        _verify_fake_loaded_predictor(
+            predictor_for(
+                FakePeftModel(base_source=str(snapshot.resolve())),
+                pipeline_core_override=FakeMergedModel(),
+            ),
+            predictor_path,
             snapshot,
         )
 
@@ -340,48 +485,62 @@ def test_disabled_or_mismatched_lora_adapter_is_rejected(
     snapshot.mkdir()
     predictor_path = tmp_path / "predictor"
     checkpoint = predictor_path / "models" / "Chronos2ResidualLoRA" / "fine-tuned-ckpt"
-    _write_adapter_artifacts(checkpoint)
+    _write_adapter_artifacts(checkpoint, base_source=str(snapshot.resolve()))
     disabled = FakePredictor(
         FakeAutoGluonModel(
             snapshot,
             "lora",
-            FakePeftModel(trainable=False, enabled=False),
+            FakePeftModel(
+                trainable=False,
+                enabled=False,
+                base_source=str(snapshot.resolve()),
+            ),
+            reload_path=checkpoint,
         )
     )
     with pytest.raises(RuntimeError, match="not enabled"):
-        verify_loaded_predictor(
-            disabled,
-            predictor_path,
-            "Chronos2ResidualLoRA",
-            "lora",
-            snapshot,
-        )
+        _verify_fake_loaded_predictor(disabled, predictor_path, snapshot)
 
-    _write_adapter_artifacts(checkpoint, rank=16, alpha=32)
+    _write_adapter_artifacts(
+        checkpoint,
+        rank=16,
+        alpha=32,
+        base_source=str(snapshot.resolve()),
+    )
     with pytest.raises(RuntimeError, match="does not match saved AutoGluon"):
-        verify_loaded_predictor(
-            FakePredictor(
-                FakeAutoGluonModel(snapshot, "lora", FakePeftModel(trainable=False))
-            ),
-            predictor_path,
-            "Chronos2ResidualLoRA",
-            "lora",
-            snapshot,
-        )
-
-    _write_adapter_artifacts(checkpoint)
-    with pytest.raises(RuntimeError, match="Loaded LoRA adapter r"):
-        verify_loaded_predictor(
+        _verify_fake_loaded_predictor(
             FakePredictor(
                 FakeAutoGluonModel(
                     snapshot,
                     "lora",
-                    FakePeftModel(trainable=False, rank=16, alpha=32),
+                    FakePeftModel(
+                        trainable=False,
+                        base_source=str(snapshot.resolve()),
+                    ),
+                    reload_path=checkpoint,
                 )
             ),
             predictor_path,
-            "Chronos2ResidualLoRA",
-            "lora",
+            snapshot,
+        )
+
+    _write_adapter_artifacts(checkpoint, base_source=str(snapshot.resolve()))
+    with pytest.raises(RuntimeError, match="Loaded LoRA adapter r"):
+        _verify_fake_loaded_predictor(
+            FakePredictor(
+                FakeAutoGluonModel(
+                    snapshot,
+                    "lora",
+                    FakePeftModel(
+                        trainable=False,
+                        rank=16,
+                        alpha=32,
+                        base_source=str(snapshot.resolve()),
+                    ),
+                    reload_path=checkpoint,
+                )
+            ),
+            predictor_path,
             snapshot,
         )
 
@@ -466,6 +625,12 @@ def test_real_peft_wrapper_is_valid_during_training_and_after_freeze() -> None:
     assert reload_state["active_adapter_names"] == ["default"]
     assert reload_state["adapter_tensor_count"] > 0
     assert reload_state["adapter_parameter_count"] > 0
+
+    merged = model.merge_and_unload()
+    assert merged is not model
+    assert not isinstance(merged, peft.PeftModel)
+    with pytest.raises(ValueError, match="No adapter layers found"):
+        peft.get_model_status(merged)
 
 
 class FakeCuda:
@@ -620,12 +785,21 @@ def _candidate_artifacts(
         "training_adapter_validation_status": "passed",
         "training_parameter_capture_point": "chronos2_pipeline_fit_return",
         "reload_trainable_parameters": 0,
-        "reload_frozen_parameters": 1_064,
-        "reload_total_parameters": 1_064,
+        "reload_frozen_parameters": 1_000,
+        "reload_total_parameters": 1_000,
+        "reload_adapter_premerge_attached": True,
+        "reload_adapter_premerge_active": True,
+        "reload_premerge_active_adapter_names": ["default"],
         "reload_adapter_tensor_count": 2,
-        "adapter_attached_after_reload": True,
-        "adapter_active_after_reload": True,
-        "active_adapter_names": ["default"],
+        "reload_adapter_parameter_count": 64,
+        "reload_adapter_checkpoint_loaded": str(checkpoint.resolve()),
+        "adapter_application_mode_after_reload": "merged_and_unloaded",
+        "adapter_merged_after_reload": True,
+        "adapter_effect_applied_after_reload": True,
+        "merged_inference_model_identity_verified": True,
+        "adapter_attached_after_reload": False,
+        "adapter_active_after_reload": False,
+        "active_adapter_names": [],
         "base_model_fallback_rejected": True,
         "adapter_validation_status": "passed",
     }

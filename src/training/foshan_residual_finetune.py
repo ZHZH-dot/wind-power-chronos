@@ -442,6 +442,157 @@ def inspect_lora_model_state(
     }
 
 
+def _require_exact_snapshot_source(value: Any, snapshot: Path, field: str) -> None:
+    source = str(value or "")
+    if not source:
+        raise RuntimeError(f"{field} does not identify the pinned Chronos-2 snapshot.")
+    try:
+        resolved = Path(source).expanduser().resolve()
+    except OSError as error:
+        raise RuntimeError(f"{field} is not a valid local snapshot path: {source!r}.") from error
+    if resolved != snapshot.resolve():
+        raise RuntimeError(
+            f"{field} {source!r} does not match the pinned Chronos-2 snapshot "
+            f"{snapshot.resolve()}."
+        )
+
+
+def _validate_loaded_lora_configuration(
+    model: Any,
+    state: dict[str, Any],
+    expected_lora_config: dict[str, Any],
+    snapshot: Path,
+) -> None:
+    for field in ("r", "lora_alpha"):
+        if expected_lora_config.get(field) is None:
+            raise RuntimeError(f"Saved AutoGluon LoRA configuration is missing {field}.")
+    for adapter_name in state["active_adapter_names"]:
+        loaded_config = model.peft_config[adapter_name]
+        _require_exact_snapshot_source(
+            getattr(loaded_config, "base_model_name_or_path", None),
+            snapshot,
+            f"Loaded LoRA adapter {adapter_name!r} base source",
+        )
+        for field in ("r", "lora_alpha"):
+            expected = expected_lora_config[field]
+            actual = getattr(loaded_config, field, None)
+            try:
+                matches = int(actual) == int(expected)
+            except (TypeError, ValueError):
+                matches = False
+            if not matches:
+                raise RuntimeError(
+                    f"Loaded LoRA adapter {field}={actual!r} does not match "
+                    f"saved AutoGluon configuration {expected!r}."
+                )
+
+
+@contextmanager
+def capture_chronos2_lora_reload(
+    checkpoint: Path,
+    snapshot: Path,
+    expected_lora_config: dict[str, Any],
+    *,
+    auto_peft_model_class: Any | None = None,
+    peft_model_class: Any | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Validate the PEFT object Chronos loads immediately before merging it."""
+    if auto_peft_model_class is None or peft_model_class is None:
+        from peft import AutoPeftModel, PeftModel
+
+        auto_peft_model_class = AutoPeftModel
+        peft_model_class = PeftModel
+
+    original_loader = auto_peft_model_class.from_pretrained
+    had_own_loader = "from_pretrained" in auto_peft_model_class.__dict__
+    original_descriptor = auto_peft_model_class.__dict__.get("from_pretrained")
+    captured: dict[str, Any] = {"_load_count": 0, "_merge_count": 0}
+    completed = False
+
+    @classmethod
+    def monitored_from_pretrained(
+        loader_class: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        del loader_class
+        if captured["_load_count"] != 0:
+            raise RuntimeError("Expected exactly one PEFT adapter load during Chronos reload.")
+        source = (
+            args[0]
+            if args
+            else kwargs.get("pretrained_model_name_or_path")
+        )
+        try:
+            loaded_path = Path(str(source)).expanduser().resolve()
+        except OSError as error:
+            raise RuntimeError(f"Invalid PEFT reload checkpoint path: {source!r}.") from error
+        if loaded_path != checkpoint.resolve():
+            raise RuntimeError(
+                "Chronos reload did not use the verified LoRA checkpoint: "
+                f"{loaded_path} != {checkpoint.resolve()}."
+            )
+
+        model = original_loader(*args, **kwargs)
+        if not isinstance(model, peft_model_class):
+            raise RuntimeError("Chronos reload returned a base-only model before LoRA merge.")
+        state = inspect_lora_model_state(model, require_trainable=False)
+        _validate_loaded_lora_configuration(
+            model, state, expected_lora_config, snapshot
+        )
+        original_merge = getattr(model, "merge_and_unload", None)
+        if not callable(original_merge):
+            raise RuntimeError("Validated LoRA model does not support merge_and_unload().")
+
+        captured.update(
+            {
+                "_load_count": 1,
+                "_premerge_model": model,
+                "_peft_model_class": peft_model_class,
+                "reload_adapter_checkpoint_loaded": str(loaded_path),
+                "reload_adapter_premerge_attached": state["adapter_attached"],
+                "reload_adapter_premerge_active": state["adapter_active"],
+                "reload_premerge_active_adapter_names": state[
+                    "active_adapter_names"
+                ],
+                "reload_premerge_available_adapter_names": state[
+                    "available_adapter_names"
+                ],
+                "reload_adapter_layer_count": state["adapter_layer_count"],
+                "reload_adapter_tensor_count": state["adapter_tensor_count"],
+                "reload_adapter_parameter_count": state[
+                    "adapter_parameter_count"
+                ],
+            }
+        )
+
+        def monitored_merge(*merge_args: Any, **merge_kwargs: Any) -> Any:
+            if captured["_merge_count"] != 0:
+                raise RuntimeError("Validated LoRA adapter was merged more than once.")
+            merged = original_merge(*merge_args, **merge_kwargs)
+            if merged is None:
+                raise RuntimeError("LoRA merge_and_unload() returned no inference model.")
+            captured["_merge_count"] = 1
+            captured["_merged_model"] = merged
+            return merged
+
+        model.merge_and_unload = monitored_merge
+        return model
+
+    auto_peft_model_class.from_pretrained = monitored_from_pretrained
+    try:
+        yield captured
+        completed = True
+    finally:
+        if had_own_loader:
+            auto_peft_model_class.from_pretrained = original_descriptor
+        else:
+            delattr(auto_peft_model_class, "from_pretrained")
+    if completed:
+        if captured["_load_count"] != 1:
+            raise RuntimeError("Chronos reload skipped the verified LoRA checkpoint.")
+        if captured["_merge_count"] != 1:
+            raise RuntimeError("Chronos reload did not merge the validated LoRA adapter.")
+
+
 def _training_parameter_metadata(model: Any, fine_tune_mode: str) -> dict[str, Any]:
     if fine_tune_mode == "lora":
         state = inspect_lora_model_state(model, require_trainable=True)
@@ -643,6 +794,9 @@ def verify_loaded_predictor(
     model_name: str,
     fine_tune_mode: str,
     snapshot: Path,
+    *,
+    auto_peft_model_class: Any | None = None,
+    peft_model_class: Any | None = None,
 ) -> dict[str, Any]:
     names = [str(value) for value in predictor.model_names()]
     if model_name not in names or len([value for value in names if value.startswith("Chronos2")]) != 1:
@@ -672,43 +826,94 @@ def verify_loaded_predictor(
             snapshot=snapshot,
             expected_lora_config=hyperparameters.get("fine_tune_lora_config"),
         )
+        _require_exact_snapshot_source(
+            artifact_info["adapter_config"].get("base_model_name_or_path"),
+            snapshot,
+            "LoRA adapter artifact base source",
+        )
     try:
-        ag_model.load_model_pipeline()
-        pipeline = getattr(ag_model, "_model_pipeline", None)
-        core = getattr(pipeline, "model", None)
-        if core is None:
-            core = getattr(pipeline, "_model", None)
-        if core is None:
-            raise RuntimeError("Could not inspect the reloaded Chronos-2 model parameters.")
         if fine_tune_mode == "lora":
-            reload_state = inspect_lora_model_state(core, require_trainable=False)
             expected_lora_config = hyperparameters.get("fine_tune_lora_config") or {}
-            for adapter_name in reload_state["active_adapter_names"]:
-                loaded_config = core.peft_config[adapter_name]
-                for field in ("r", "lora_alpha"):
-                    expected = expected_lora_config.get(field)
-                    actual = getattr(loaded_config, field, None)
-                    try:
-                        matches = expected is None or int(actual) == int(expected)
-                    except (TypeError, ValueError):
-                        matches = False
-                    if not matches:
-                        raise RuntimeError(
-                            f"Loaded LoRA adapter {field}={actual!r} does not match "
-                            f"saved AutoGluon configuration {expected!r}."
-                        )
+            with capture_chronos2_lora_reload(
+                checkpoint,
+                snapshot,
+                expected_lora_config,
+                auto_peft_model_class=auto_peft_model_class,
+                peft_model_class=peft_model_class,
+            ) as reload_capture:
+                ag_model.load_model_pipeline()
+                if reload_capture["_load_count"] != 1:
+                    raise RuntimeError(
+                        "Chronos reload skipped the verified LoRA checkpoint."
+                    )
+                if reload_capture["_merge_count"] != 1:
+                    raise RuntimeError(
+                        "Chronos reload did not merge the validated LoRA adapter."
+                    )
+                pipeline = getattr(ag_model, "_model_pipeline", None)
+                core = getattr(pipeline, "model", None)
+                if core is None:
+                    core = getattr(pipeline, "_model", None)
+                if core is None:
+                    raise RuntimeError(
+                        "Could not inspect the reloaded Chronos-2 model parameters."
+                    )
+                if core is not reload_capture.get("_merged_model"):
+                    raise RuntimeError(
+                        "Chronos inference pipeline does not use the model returned by "
+                        "the verified LoRA merge."
+                    )
+                if core is reload_capture.get("_premerge_model") or isinstance(
+                    core, reload_capture["_peft_model_class"]
+                ):
+                    raise RuntimeError(
+                        "Chronos inference retained a live PEFT adapter after reload."
+                    )
+            reload_state = _parameter_counts(core)
             adapter_reload = {
-                "adapter_attached_after_reload": reload_state["adapter_attached"],
-                "adapter_active_after_reload": reload_state["adapter_active"],
-                "active_adapter_names": reload_state["active_adapter_names"],
-                "available_adapter_names": reload_state["available_adapter_names"],
-                "reload_adapter_layer_count": reload_state["adapter_layer_count"],
-                "reload_adapter_tensor_count": reload_state["adapter_tensor_count"],
-                "reload_adapter_parameter_count": reload_state["adapter_parameter_count"],
+                "reload_adapter_premerge_attached": reload_capture[
+                    "reload_adapter_premerge_attached"
+                ],
+                "reload_adapter_premerge_active": reload_capture[
+                    "reload_adapter_premerge_active"
+                ],
+                "reload_premerge_active_adapter_names": reload_capture[
+                    "reload_premerge_active_adapter_names"
+                ],
+                "reload_premerge_available_adapter_names": reload_capture[
+                    "reload_premerge_available_adapter_names"
+                ],
+                "reload_adapter_checkpoint_loaded": reload_capture[
+                    "reload_adapter_checkpoint_loaded"
+                ],
+                "reload_adapter_layer_count": reload_capture[
+                    "reload_adapter_layer_count"
+                ],
+                "reload_adapter_tensor_count": reload_capture[
+                    "reload_adapter_tensor_count"
+                ],
+                "reload_adapter_parameter_count": reload_capture[
+                    "reload_adapter_parameter_count"
+                ],
+                "adapter_application_mode_after_reload": "merged_and_unloaded",
+                "adapter_merged_after_reload": True,
+                "adapter_effect_applied_after_reload": True,
+                "merged_inference_model_identity_verified": True,
+                "adapter_attached_after_reload": False,
+                "adapter_active_after_reload": False,
+                "active_adapter_names": [],
+                "available_adapter_names": [],
                 "base_model_fallback_rejected": True,
                 "adapter_validation_status": "passed",
             }
         else:
+            ag_model.load_model_pipeline()
+            pipeline = getattr(ag_model, "_model_pipeline", None)
+            core = getattr(pipeline, "model", None)
+            if core is None:
+                core = getattr(pipeline, "_model", None)
+            if core is None:
+                raise RuntimeError("Could not inspect the reloaded Chronos-2 model parameters.")
             reload_state = _parameter_counts(core)
             adapter_reload = {
                 "adapter_attached_after_reload": False,
@@ -1070,8 +1275,14 @@ def _validate_completed_candidate(candidate_dir: Path, manifest: dict[str, Any])
     _validate_training_parameter_metadata(manifest, fine_tune_mode)
     if fine_tune_mode == "lora":
         required_reload = {
-            "adapter_attached_after_reload": True,
-            "adapter_active_after_reload": True,
+            "reload_adapter_premerge_attached": True,
+            "reload_adapter_premerge_active": True,
+            "adapter_application_mode_after_reload": "merged_and_unloaded",
+            "adapter_merged_after_reload": True,
+            "adapter_effect_applied_after_reload": True,
+            "merged_inference_model_identity_verified": True,
+            "adapter_attached_after_reload": False,
+            "adapter_active_after_reload": False,
             "base_model_fallback_rejected": True,
             "adapter_validation_status": "passed",
         }
@@ -1080,9 +1291,9 @@ def _validate_completed_candidate(candidate_dir: Path, manifest: dict[str, Any])
             for field, expected in required_reload.items()
             if manifest.get(field) != expected
         ]
-        if failures or not manifest.get("active_adapter_names"):
+        if failures or not manifest.get("reload_premerge_active_adapter_names"):
             raise RuntimeError(
-                "Completed LoRA candidate lacks verified active-adapter reload metadata: "
+                "Completed LoRA candidate lacks verified merged-adapter reload metadata: "
                 f"{failures}."
             )
         try:
@@ -1090,11 +1301,20 @@ def _validate_completed_candidate(candidate_dir: Path, manifest: dict[str, Any])
             reload_frozen = int(manifest["reload_frozen_parameters"])
             reload_total = int(manifest["reload_total_parameters"])
             reload_tensors = int(manifest["reload_adapter_tensor_count"])
+            reload_adapter_parameters = int(
+                manifest["reload_adapter_parameter_count"]
+            )
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeError(
                 "Completed LoRA candidate lacks valid reload parameter metadata."
             ) from error
-        if reload_total != reload_trainable + reload_frozen or reload_tensors <= 0:
+        if (
+            reload_total != reload_trainable + reload_frozen
+            or reload_tensors <= 0
+            or reload_adapter_parameters <= 0
+            or manifest.get("reload_adapter_checkpoint_loaded")
+            != str(checkpoint.resolve())
+        ):
             raise RuntimeError("Completed LoRA candidate reload metadata is inconsistent.")
 
 
