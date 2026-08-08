@@ -223,7 +223,7 @@ def build_realized_inputs(
     minute = raw_realized["timestamp"].dt.hour * 60 + raw_realized["timestamp"].dt.minute
     raw_realized["price"] = minute.map(profile)
     april_realized = raw_realized.loc[
-        (raw_realized["timestamp"] >= APRIL_START - pd.Timedelta(minutes=5))
+        (raw_realized["timestamp"] >= APRIL_START - pd.Timedelta(days=1))
         & (raw_realized["timestamp"] < MAY_START)
     ].copy()
     may_dispatch = load_reference_dispatch(dispatch_path)[
